@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.10.1
+// @version      2026.10.10.2
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -489,6 +489,86 @@
         controls.downloadButton.style.backgroundColor = color
     }
 
+    function formatVideoElapsed(milliseconds) {
+        const totalSeconds = Math.max(0, Math.floor(Number(milliseconds || 0) / 1000))
+        if (totalSeconds < 60) return totalSeconds + ' 秒'
+        const minutes = Math.floor(totalSeconds / 60)
+        const seconds = String(totalSeconds % 60).padStart(2, '0')
+        return minutes + ' 分 ' + seconds + ' 秒'
+    }
+
+    function runVideoStageWithTimeout(task, options) {
+        const settings = options || {}
+        const runtime = settings.runtime || {}
+        const parentSignal = runtime.controller && runtime.controller.signal
+        const stageController = new AbortController()
+        const stageRuntime = { controller: stageController, clearing: Boolean(runtime.clearing) }
+        const startedAt = Date.now()
+        const timeoutMs = Math.max(1000, Number(settings.timeoutMs) || 15 * 60 * 1000)
+        const heartbeatMs = Math.max(250, Number(settings.heartbeatMs) || 1000)
+
+        return new Promise((resolve, reject) => {
+            let settled = false
+            let timeoutId = null
+            let heartbeatId = null
+            let parentAbortHandler = null
+
+            const cleanup = () => {
+                if (timeoutId) clearTimeout(timeoutId)
+                if (heartbeatId) clearInterval(heartbeatId)
+                if (parentSignal && parentAbortHandler) {
+                    parentSignal.removeEventListener('abort', parentAbortHandler)
+                }
+            }
+            const settle = (handler, value) => {
+                if (settled) return
+                settled = true
+                cleanup()
+                handler(value)
+            }
+            const label = settings.label || '当前处理阶段'
+
+            parentAbortHandler = () => {
+                try { stageController.abort() } catch (_) {}
+                settle(reject, new Error('下载已取消'))
+            }
+            if (parentSignal) {
+                if (parentSignal.aborted) {
+                    parentAbortHandler()
+                    return
+                }
+                parentSignal.addEventListener('abort', parentAbortHandler, { once: true })
+            }
+
+            timeoutId = setTimeout(() => {
+                if (settled) return
+                if (typeof settings.onTimeout === 'function') {
+                    try { settings.onTimeout(stageRuntime) } catch (_) {}
+                }
+                try { stageController.abort() } catch (_) {}
+                settle(reject, new Error(label + '超时，缓存已保留，请点击“重新导出”重试'))
+            }, timeoutMs)
+
+            heartbeatId = setInterval(() => {
+                if (settled || !settings.controls || !settings.controls.progress) return
+                if (typeof settings.heartbeat === 'function') {
+                    settings.heartbeat({
+                        runtime: stageRuntime,
+                        elapsedMs: Date.now() - startedAt,
+                        label: label
+                    })
+                    return
+                }
+                settings.controls.progress.textContent = label + '（已用时 ' +
+                    formatVideoElapsed(Date.now() - startedAt) + '，仍在处理）'
+            }, heartbeatMs)
+
+            Promise.resolve()
+                .then(() => task(stageRuntime))
+                .then(value => settle(resolve, value), error => settle(reject, error))
+        })
+    }
+
     function getMuxJs() {
         const candidate = typeof muxjs !== 'undefined'
             ? muxjs
@@ -508,6 +588,28 @@
         objectUrls: [],
         queue: Promise.resolve(),
         active: null
+    }
+
+    function resetFfmpegState(instance) {
+        const target = instance || ffmpegState.instance
+        if (target && typeof target.terminate === 'function') {
+            try { target.terminate() } catch (_) {}
+        }
+        if (!instance || ffmpegState.instance === target) {
+            ffmpegState.instance = null
+            ffmpegState.loadPromise = null
+            for (const objectUrl of ffmpegState.objectUrls.splice(0)) {
+                try { URL.revokeObjectURL(objectUrl) } catch (_) {}
+            }
+        }
+    }
+
+    function deleteFfmpegFileSafely(ffmpeg, filename) {
+        if (!ffmpeg || typeof ffmpeg.deleteFile !== 'function') return Promise.resolve()
+        return Promise.race([
+            Promise.resolve().then(() => ffmpeg.deleteFile(filename)).catch(() => {}),
+            new Promise(resolve => setTimeout(resolve, 5000))
+        ])
     }
 
     function isVideoRuntimeCancelled(runtime) {
@@ -548,25 +650,30 @@
                 if (!active || !active.controls || isVideoRuntimeCancelled(active.runtime)) return
                 const progress = Number(event && event.progress)
                 if (Number.isFinite(progress) && progress >= 0) {
+                    active.lastProgressAt = Date.now()
                     active.controls.progress.textContent = '正在整理为 115 兼容 MP4：' + Math.min(100, Math.round(progress * 100)) + '%'
                 }
             })
-            const coreURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.js', 'text/javascript', runtime)
-            const wasmURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.wasm', 'application/wasm', runtime)
-            await ffmpeg.load({ coreURL: coreURL, wasmURL: wasmURL }, {
-                signal: runtime && runtime.controller ? runtime.controller.signal : undefined
-            })
-            return ffmpeg
+            const signal = runtime && runtime.controller ? runtime.controller.signal : undefined
+            const terminateOnAbort = () => resetFfmpegState(ffmpeg)
+            if (signal) {
+                if (signal.aborted) terminateOnAbort()
+                else signal.addEventListener('abort', terminateOnAbort, { once: true })
+            }
+            try {
+                const coreURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.js', 'text/javascript', runtime)
+                const wasmURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.wasm', 'application/wasm', runtime)
+                await ffmpeg.load({ coreURL: coreURL, wasmURL: wasmURL }, { signal: signal })
+                return ffmpeg
+            } finally {
+                if (signal) signal.removeEventListener('abort', terminateOnAbort)
+            }
         })()
 
         try {
             return await ffmpegState.loadPromise
         } catch (error) {
-            if (ffmpegState.instance && typeof ffmpegState.instance.terminate === 'function') {
-                try { ffmpegState.instance.terminate() } catch (_) {}
-            }
-            ffmpegState.instance = null
-            ffmpegState.loadPromise = null
+            resetFfmpegState()
             throw error
         }
     }
@@ -599,52 +706,90 @@
     }
 
     async function remuxFragmentedMp4ToProgressiveMp4(inputBlob, controls, runtime) {
-        if (inputBlob.size > FFMPEG_MAX_INPUT_BYTES) {
-            throw new Error('该视频超过浏览器 MP4 整理上限（1.5 GiB），缓存已保留；请使用桌面 FFmpeg 无损转封装后再上传 115')
-        }
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
 
+        if (inputBlob.size > FFMPEG_MAX_INPUT_BYTES) {
+            controls.progress.textContent = '文件过大，已直接导出原始 MP4；未进行浏览器兼容整理'
+            return { blob: inputBlob, compatible: false, tooLarge: true }
+        }
+
+        const timeoutMs = Math.min(
+            15 * 60 * 1000,
+            Math.max(3 * 60 * 1000, 3 * 60 * 1000 + Math.ceil(inputBlob.size / (8 * 1024 * 1024)) * 1000)
+        )
         return queueFfmpegTask(async () => {
-            if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
-            const ffmpeg = await getFfmpeg(runtime)
-            if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
             const inputName = 'missav-fragmented-input.mp4'
             const outputName = 'missav-progressive-output.mp4'
-            ffmpegState.active = { controls: controls, runtime: runtime }
+            const active = { controls: controls, runtime: runtime, lastProgressAt: 0 }
+            let ffmpeg = null
+            let stageAbortHandler = null
+            let stageSignal = null
+            ffmpegState.active = active
             try {
-                controls.progress.textContent = '正在整理为 115 兼容 MP4…首次使用会加载约 31 MB 组件'
-                await ffmpeg.deleteFile(inputName).catch(() => {})
-                await ffmpeg.deleteFile(outputName).catch(() => {})
-                const inputBytes = new Uint8Array(await inputBlob.arrayBuffer())
-                if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
-                await ffmpeg.writeFile(inputName, inputBytes)
-                await ffmpeg.exec([
-                    '-i', inputName,
-                    '-map', '0:v:0',
-                    '-map', '0:a?',
-                    '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-movflags', '+faststart',
-                    outputName
-                ], -1, {
-                    signal: runtime && runtime.controller ? runtime.controller.signal : undefined
+                return await runVideoStageWithTimeout(async stageRuntime => {
+                    stageAbortHandler = () => resetFfmpegState(ffmpeg || ffmpegState.instance)
+                    stageSignal = stageRuntime.controller.signal
+                    stageSignal.addEventListener('abort', stageAbortHandler, { once: true })
+                    const ffmpegRuntime = {
+                        controller: stageRuntime.controller,
+                        clearing: Boolean(runtime && runtime.clearing)
+                    }
+                    controls.progress.textContent = '正在加载 MP4 整理组件…首次使用会加载约 31 MB 组件'
+                    ffmpeg = await getFfmpeg(ffmpegRuntime)
+                    if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+                    controls.progress.textContent = '正在整理为 115 兼容 MP4：准备输入数据'
+                    await deleteFfmpegFileSafely(ffmpeg, inputName)
+                    await deleteFfmpegFileSafely(ffmpeg, outputName)
+                    const inputBytes = new Uint8Array(await inputBlob.arrayBuffer())
+                    if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+                    controls.progress.textContent = '正在整理为 115 兼容 MP4：写入输入数据'
+                    await ffmpeg.writeFile(inputName, inputBytes)
+                    controls.progress.textContent = '正在整理为 115 兼容 MP4：开始无损整理'
+                    await ffmpeg.exec([
+                        '-i', inputName,
+                        '-map', '0:v:0',
+                        '-map', '0:a?',
+                        '-c', 'copy',
+                        '-avoid_negative_ts', 'make_zero',
+                        '-movflags', '+faststart',
+                        outputName
+                    ], -1, { signal: stageRuntime.controller.signal })
+                    if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+                    controls.progress.textContent = '正在整理为 115 兼容 MP4：读取输出文件'
+                    const outputBytes = await ffmpeg.readFile(outputName)
+                    if (!outputBytes || !outputBytes.byteLength) throw new Error('MP4 整理失败：没有生成输出文件')
+                    const view = outputBytes instanceof Uint8Array
+                        ? outputBytes
+                        : new Uint8Array(outputBytes)
+                    return { blob: new Blob([view], { type: 'video/mp4' }), compatible: true, tooLarge: false }
+                }, {
+                    runtime: runtime,
+                    controls: controls,
+                    label: 'MP4 整理',
+                    timeoutMs: timeoutMs,
+                    heartbeat: heartbeat => {
+                        const state = ffmpegState.active
+                        if (state && state.lastProgressAt && Date.now() - state.lastProgressAt < 3000) return
+                        controls.progress.textContent = 'MP4 整理中（已用时 ' +
+                            formatVideoElapsed(heartbeat.elapsedMs) + '，浏览器仍在处理）'
+                    },
+                    onTimeout: () => {
+                        resetFfmpegState(ffmpeg || ffmpegState.instance)
+                        if (ffmpegState.active === active) ffmpegState.active = null
+                    }
                 })
-                if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
-                const outputBytes = await ffmpeg.readFile(outputName)
-                if (!outputBytes || !outputBytes.byteLength) throw new Error('MP4 整理失败：没有生成输出文件')
-                const view = outputBytes instanceof Uint8Array
-                    ? outputBytes
-                    : new Uint8Array(outputBytes)
-                return new Blob([view], { type: 'video/mp4' })
             } catch (error) {
                 if (isVideoRuntimeCancelled(runtime) || (error && error.name === 'AbortError')) {
                     throw new Error('下载已取消')
                 }
                 throw new Error('MP4 整理失败：' + (error && error.message ? error.message : error))
             } finally {
-                ffmpegState.active = null
-                await ffmpeg.deleteFile(inputName).catch(() => {})
-                await ffmpeg.deleteFile(outputName).catch(() => {})
+                if (stageSignal && stageAbortHandler) {
+                    stageSignal.removeEventListener('abort', stageAbortHandler)
+                }
+                if (ffmpegState.active === active) ffmpegState.active = null
+                await deleteFfmpegFileSafely(ffmpeg, inputName)
+                await deleteFfmpegFileSafely(ffmpeg, outputName)
             }
         })
     }
@@ -701,21 +846,26 @@
         const blobs = []
         for (let i = 0; i < job.segments.length; i++) {
             if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+            if (i === 0 || (i + 1) % 10 === 0 || i + 1 === job.segments.length) {
+                controls.progress.textContent = '正在读取缓存 ' + (i + 1) + '/' + job.segments.length + ' 个分片'
+            }
             const blob = await getVideoSegment(job.id, i)
             if (!blob) throw new Error('缓存中缺少第 ' + (i + 1) + ' 个分片')
             blobs.push(blob)
         }
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+        controls.progress.textContent = '正在拼接 ' + blobs.length + ' 个分片'
         const assembledBlob = job.container === 'ts'
             ? await transmuxTsToMp4(blobs, controls, runtime)
             : new Blob(blobs, { type: 'video/mp4' })
         blobs.length = 0
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
         const fragmented = await isFragmentedMp4(assembledBlob)
-        const outputBlob = fragmented
+        const remuxResult = fragmented
             ? await remuxFragmentedMp4ToProgressiveMp4(assembledBlob, controls, runtime)
-            : assembledBlob
-        if (fragmented && await isFragmentedMp4(outputBlob)) {
+            : { blob: assembledBlob, compatible: true, tooLarge: false }
+        const outputBlob = remuxResult.blob
+        if (fragmented && remuxResult.compatible && await isFragmentedMp4(outputBlob)) {
             throw new Error('MP4 整理失败：输出仍是分片 MP4，缓存已保留')
         }
         const blobUrl = URL.createObjectURL(outputBlob)
@@ -728,9 +878,11 @@
         link.remove()
         setTimeout(() => URL.revokeObjectURL(blobUrl), 60000)
         updateVideoControls(controls, '重新导出', 'lightgreen', false)
-        controls.progress.textContent = fragmented
-            ? '已完成（普通 MP4），缓存仍保留；不需要时点击“清除缓存”'
-            : '已完成（MP4），缓存仍保留；不需要时点击“清除缓存”'
+        controls.progress.textContent = remuxResult.tooLarge
+            ? '已完成（原始 MP4）；文件过大，未进行浏览器兼容整理，上传 115 可能仍需桌面 FFmpeg；缓存仍保留'
+            : fragmented
+                ? '已完成（普通 MP4），缓存仍保留；不需要时点击“清除缓存”'
+                : '已完成（MP4），缓存仍保留；不需要时点击“清除缓存”'
     }
 
     async function startOrResumeVideoDownload(fileInfo, controls) {
