@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.9.27.2
+// @version      2026.10.10.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -2059,6 +2059,26 @@
         return items.find(item => item.isFolder && get115FileNameKey(item.name) === get115FileNameKey(folderName)) || null
     }
 
+    function find115SubtitleFolderFromNormalizedResults(items, folderName) {
+        const normalizeName = value => String(value || '').trim().replace(/\s+/g, ' ').toUpperCase()
+        const expectedName = normalizeName(folderName)
+        const list = Array.isArray(items) ? items : []
+        const direct = list.find(item => item && item.isFolder && item.folderCid && normalizeName(item.name) === expectedName)
+        if (direct) return direct
+
+        const code = String(folderName || '').trim().match(/^([A-Za-z]{2,10})[-_ ]?(\d{1,8})$/)
+        if (!code) return null
+        const prefix = code[1].toUpperCase()
+        const number = String(Number(code[2]))
+        const videoPattern = new RegExp('(?:^|[^A-Z0-9])' + prefix + '[-_ ]?0*' + number + '(?!\\d)', 'i')
+        const video = list.find(item => item && !item.isFolder && item.isVideo &&
+            /^\d+$/.test(String(item.parentCid || '')) && String(item.parentCid) !== '0' &&
+            videoPattern.test(String(item.name || '')))
+        return video
+            ? { name: String(folderName || '').trim(), folderCid: String(video.parentCid), fromVideo: true }
+            : null
+    }
+
     async function ensure115LocalSyncFolder(parentCid, folderName) {
         const existing = await find115FolderByName(parentCid, folderName)
         if (existing && existing.folderCid) return existing.folderCid
@@ -2229,8 +2249,14 @@
         if (direct && direct.folderCid) return direct
         // 有些 115 页面接口只返回当前列表的文件，不返回目录；根目录再用搜索接口兜底。
         if (String(parentCid || '0') !== '0') return null
-        const candidates = (await request115CloudSearch(folderName)).map(normalize115File)
-        return candidates.find(item => item.isFolder && get115FileNameKey(item.name) === get115FileNameKey(folderName) && item.folderCid) || null
+        const keys = get115SearchKeywords(folderName)
+        const searchTerms = Array.from(new Set([keys.exact, keys.fallback, folderName].filter(Boolean)))
+        for (const searchTerm of searchTerms) {
+            const candidates = (await request115CloudSearch(searchTerm)).map(normalize115File)
+            const found = find115SubtitleFolderFromNormalizedResults(candidates, folderName)
+            if (found && found.folderCid) return found
+        }
+        return null
     }
 
     async function saveSubtitleTo115SameNumberFolder(payload) {
@@ -4335,6 +4361,36 @@
         return String(keyword || '').trim().replace(/\s+/g, ' ').toUpperCase()
     }
 
+    function parseSubtitleCode(value) {
+        const match = normalizeSubtitleKeyword(value).match(/^([A-Z]{2,10})[-_ ]?(\d{1,8})$/)
+        if (!match) return null
+        return { prefix: match[1], number: String(Number(match[2])) }
+    }
+
+    function subtitleResultMatchesKeyword(item, keyword) {
+        const target = parseSubtitleCode(keyword)
+        if (!target) return true
+        const itemUrl = String(item && item.url || '')
+        const source = [item && item.name, item && item.title, /^data:/i.test(itemUrl) ? '' : itemUrl, item && item.pageUrl]
+            .filter(Boolean)
+            .join(' ')
+        const pattern = /(?:^|[^A-Z0-9])([A-Z]{2,10})[-_ ]?(\d{1,8})(?!\d)/gi
+        for (const match of source.matchAll(pattern)) {
+            if (match[1].toUpperCase() === target.prefix && String(Number(match[2])) === target.number) return true
+        }
+        return false
+    }
+
+    function subtitleResultMatchScore(item, keyword) {
+        if (!subtitleResultMatchesKeyword(item, keyword)) return -1
+        const compactKeyword = normalizeSubtitleKeyword(keyword).replace(/[\s_-]+/g, '')
+        const name = normalizeSubtitleKeyword(item && item.name).replace(/[\s_-]+/g, '')
+        const url = normalizeSubtitleKeyword(item && item.url).replace(/[\s_-]+/g, '')
+        if (name.includes(compactKeyword)) return 3
+        if (url.includes(compactKeyword)) return 2
+        return 1
+    }
+
     function readSubtitleSearchCache(keyword) {
         const key = normalizeSubtitleKeyword(keyword)
         if (!key) return []
@@ -4405,14 +4461,16 @@
         return Boolean(preference.name && item.name === preference.name && preference.source === item.source)
     }
 
-    function mergeSubtitleResults(target, items) {
+    function mergeSubtitleResults(target, items, keyword) {
         const seen = new Set(target.map(item => item.url || (item.source + '|' + item.name)))
         for (const item of items || []) {
+            if (!subtitleResultMatchesKeyword(item, keyword)) continue
             const key = item.url || (item.source + '|' + item.name)
             if (!key || seen.has(key)) continue
             seen.add(key)
             target.push(item)
         }
+        target.sort((a, b) => subtitleResultMatchScore(b, keyword) - subtitleResultMatchScore(a, keyword))
     }
 
     // ==================== 字幕解析模块 ====================
@@ -4851,7 +4909,7 @@
         box.classList.add('show')
         const cached = readSubtitleSearchCache(keyword)
         const all = []
-        mergeSubtitleResults(all, cached)
+        mergeSubtitleResults(all, cached, keyword)
         let searching = true
 
         const render = () => {
@@ -4939,7 +4997,7 @@
         const jobs = [searchXunlei(keyword), searchSubDog(keyword), searchSubtitleCat(keyword), searchYify(keyword)]
         await Promise.all(jobs.map(p => p.then(items => {
             if (searchId !== subtitleSearchSequence) return
-            mergeSubtitleResults(all, items)
+            mergeSubtitleResults(all, items, keyword)
             render()
         }).catch(() => {})))
         if (searchId !== subtitleSearchSequence) return
