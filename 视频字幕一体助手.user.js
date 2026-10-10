@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.10.2
+// @version      2026.10.10.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -187,7 +187,9 @@
                 const handles = Array.isArray(stores)
                     ? stores.map(name => tx.objectStore(name))
                     : tx.objectStore(stores)
-                result = operation(handles)
+                result = Array.isArray(handles)
+                    ? operation(...handles)
+                    : operation(handles)
             } catch (error) {
                 closeAndReject(error)
             }
