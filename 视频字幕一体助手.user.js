@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.10.3
+// @version      2026.10.11.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -582,7 +582,9 @@
 
     // mux.js 输出的是 fragmented MP4（moov/mvex + 多个 moof/mdat）。
     // 115 的转码入口对这类文件兼容性不稳定，因此导出前做一次无损整理。
-    const FFMPEG_CORE_BASE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd'
+    const FFMPEG_CORE_BASE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
+    const FFMPEG_LIBRARY_ESM_BASE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm'
+    const FFMPEG_MODULE_WORKER_SOURCE_URL = FFMPEG_LIBRARY_ESM_BASE_URL + '/worker.js'
     const FFMPEG_MAX_INPUT_BYTES = 1536 * 1024 * 1024
     const ffmpegState = {
         instance: null,
@@ -638,6 +640,27 @@
         return blobUrl
     }
 
+    function rewriteFfmpegModuleWorkerSource(source, baseUrl) {
+        const normalizedBaseUrl = String(baseUrl || '').replace(/\/$/, '')
+        return String(source || '')
+            .replace(/from\s+(["'])\.\/const\.js\1/g, 'from "' + normalizedBaseUrl + '/const.js"')
+            .replace(/from\s+(["'])\.\/errors\.js\1/g, 'from "' + normalizedBaseUrl + '/errors.js"')
+    }
+
+    async function fetchFfmpegModuleWorkerUrl(runtime) {
+        const response = await fetch(FFMPEG_MODULE_WORKER_SOURCE_URL, {
+            mode: 'cors',
+            cache: 'force-cache',
+            signal: runtime && runtime.controller ? runtime.controller.signal : undefined
+        })
+        if (!response.ok) throw new Error('加载 MP4 Worker 组件失败：HTTP ' + response.status)
+        const source = await response.text()
+        const rewrittenSource = rewriteFfmpegModuleWorkerSource(source, FFMPEG_LIBRARY_ESM_BASE_URL)
+        const blobUrl = URL.createObjectURL(new Blob([rewrittenSource], { type: 'text/javascript' }))
+        ffmpegState.objectUrls.push(blobUrl)
+        return blobUrl
+    }
+
     async function getFfmpeg(runtime) {
         if (ffmpegState.instance && ffmpegState.instance.loaded) return ffmpegState.instance
         if (ffmpegState.loadPromise) return ffmpegState.loadPromise
@@ -665,7 +688,12 @@
             try {
                 const coreURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.js', 'text/javascript', runtime)
                 const wasmURL = await fetchFfmpegBlobUrl(FFMPEG_CORE_BASE_URL + '/ffmpeg-core.wasm', 'application/wasm', runtime)
-                await ffmpeg.load({ coreURL: coreURL, wasmURL: wasmURL }, { signal: signal })
+                const classWorkerURL = await fetchFfmpegModuleWorkerUrl(runtime)
+                await ffmpeg.load({
+                    coreURL: coreURL,
+                    wasmURL: wasmURL,
+                    classWorkerURL: classWorkerURL
+                }, { signal: signal })
                 return ffmpeg
             } finally {
                 if (signal) signal.removeEventListener('abort', terminateOnAbort)
