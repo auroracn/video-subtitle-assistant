@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.11.1
+// @version      2026.10.11.2
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -4704,6 +4704,132 @@
     }
 
     // ==================== 视频控制模块 ====================
+    function shouldResumeBackgroundPlayback(video, guard) {
+        return Boolean(guard && guard.wasPlayingBeforeHidden && video && video.paused && !video.ended);
+    }
+
+    const backgroundPlaybackGuards = new Set();
+    let backgroundPlaybackLifecycleInstalled = false;
+
+    function isPageHidden() {
+        return document.hidden || document.visibilityState === 'hidden';
+    }
+
+    function installBackgroundPlaybackLifecycle() {
+        if (backgroundPlaybackLifecycleInstalled) return;
+        backgroundPlaybackLifecycleInstalled = true;
+
+        const handleVisibility = () => {
+            if (isPageHidden()) {
+                backgroundPlaybackGuards.forEach(guard => guard.enterBackground());
+            } else {
+                backgroundPlaybackGuards.forEach(guard => guard.leaveBackground());
+            }
+        };
+
+        document.addEventListener('visibilitychange', handleVisibility, true);
+        window.addEventListener('blur', () => {
+            backgroundPlaybackGuards.forEach(guard => guard.enterBackground());
+        }, true);
+        window.addEventListener('focus', () => {
+            if (!isPageHidden()) {
+                backgroundPlaybackGuards.forEach(guard => guard.leaveBackground());
+            }
+        }, true);
+    }
+
+    function installBackgroundPlaybackGuard(video) {
+        if (!video || video._avBackgroundPlaybackGuard) return;
+        installBackgroundPlaybackLifecycle();
+
+        const guard = {
+            video,
+            wasPlayingBeforeHidden: !video.paused && !video.ended,
+            lastKnownPlaying: !video.paused && !video.ended,
+            backgroundMode: false,
+            resumeAttempts: 0,
+            retryTimer: null,
+            enterBackground() {
+                if (video.ended) return;
+                // blur 和 visibilitychange 可能连续触发，不能因第二次触发时
+                // 播放器已经被浏览器暂停而丢失“之前正在播放”的状态。
+                if (this.backgroundMode && this.wasPlayingBeforeHidden) return;
+                const wasPlaying = (!video.paused && !video.ended) || this.lastKnownPlaying;
+                this.wasPlayingBeforeHidden = wasPlaying;
+                this.backgroundMode = wasPlaying;
+                this.resumeAttempts = 0;
+                if (!wasPlaying) this.clearRetry();
+            },
+            leaveBackground() {
+                const shouldResume = this.backgroundMode && shouldResumeBackgroundPlayback(video, this);
+                this.backgroundMode = false;
+                this.clearRetry();
+                this.resumeAttempts = 0;
+                if (shouldResume) this.resume(false);
+                this.wasPlayingBeforeHidden = false;
+                this.lastKnownPlaying = !video.paused && !video.ended;
+            },
+            clearRetry() {
+                if (this.retryTimer) {
+                    clearTimeout(this.retryTimer);
+                    this.retryTimer = null;
+                }
+            },
+            resume(allowRetry) {
+                if (!shouldResumeBackgroundPlayback(video, this) || this.resumeAttempts >= 8) return;
+                this.resumeAttempts += 1;
+                let playResult;
+                try {
+                    playResult = video.play();
+                } catch (error) {
+                    playResult = Promise.reject(error);
+                }
+                if (playResult && typeof playResult.catch === 'function') {
+                    playResult.catch(() => {
+                        if (!allowRetry || !this.backgroundMode || !shouldResumeBackgroundPlayback(video, this)) return;
+                        this.clearRetry();
+                        this.retryTimer = setTimeout(() => {
+                            this.retryTimer = null;
+                            this.resume(true);
+                        }, 1000);
+                    });
+                }
+            },
+            onPause() {
+                const hidden = isPageHidden();
+                const wasPlaying = this.lastKnownPlaying || this.backgroundMode;
+                this.lastKnownPlaying = false;
+                // 只在切到后台前确实处于播放状态时恢复，用户在前台手动暂停不会被改回播放。
+                if ((hidden || this.backgroundMode) && wasPlaying && !video.ended) {
+                    this.wasPlayingBeforeHidden = true;
+                    this.backgroundMode = true;
+                    this.resume(true);
+                }
+            },
+            onPlay() {
+                this.lastKnownPlaying = true;
+                this.clearRetry();
+                // 后台续播成功后保留 backgroundMode，避免浏览器再次暂停时丢失续播意图。
+                if (!this.backgroundMode) {
+                    this.wasPlayingBeforeHidden = false;
+                    this.resumeAttempts = 0;
+                }
+            },
+            onEnded() {
+                this.backgroundMode = false;
+                this.wasPlayingBeforeHidden = false;
+                this.lastKnownPlaying = false;
+                this.clearRetry();
+            }
+        };
+
+        video._avBackgroundPlaybackGuard = guard;
+        backgroundPlaybackGuards.add(guard);
+        video.addEventListener('pause', guard.onPause, true);
+        video.addEventListener('play', guard.onPlay, true);
+        video.addEventListener('ended', guard.onEnded, true);
+    }
+
     function canBeControlled(video) {
         if (!video || video.tagName !== 'VIDEO') return false;
         const rect = video.getBoundingClientRect();
@@ -4739,6 +4865,7 @@
 
         state.currentVideo = video;
         if (video && !video._isIframe) {
+            installBackgroundPlaybackGuard(video);
             video.dataset.avSelected = 'true';
             if (state.isAccelerating) video.playbackRate = state.currentSpeed;
             video.volume = state.currentVolume;
@@ -6009,6 +6136,7 @@
             videos.forEach(video => {
                 if (!video.dataset.avInitialized) {
                     video.dataset.avInitialized = 'true';
+                    installBackgroundPlaybackGuard(video);
                     video.addEventListener('play', () => {
                         if (!state.currentVideo) switchToVideo(video);
                         if (state.isAccelerating && video.playbackRate !== state.currentSpeed) {
