@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.11.2
+// @version      2026.10.11.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -4708,8 +4708,73 @@
         return Boolean(guard && guard.wasPlayingBeforeHidden && video && video.paused && !video.ended);
     }
 
+    function shouldKeepBackgroundPlayback(video, guard) {
+        return Boolean(guard && guard.backgroundMode && guard.wasPlayingBeforeHidden && video && !video.ended);
+    }
+
     const backgroundPlaybackGuards = new Set();
     let backgroundPlaybackLifecycleInstalled = false;
+    let pageContextPauseGuardInstalled = false;
+
+    function installPageContextPauseGuardBridge() {
+        if (pageContextPauseGuardInstalled) return;
+        pageContextPauseGuardInstalled = true;
+
+        const patchPrototype = prototype => {
+            if (!prototype || prototype.__avBackgroundPauseGuardInstalled || typeof prototype.pause !== 'function') return false;
+            const originalPause = prototype.pause;
+            const guardedPause = function () {
+                if (this && this.dataset && this.dataset.avBackgroundKeepPlaying === '1' && !this.ended) {
+                    try {
+                        const playResult = this.play();
+                        if (playResult && typeof playResult.catch === 'function') playResult.catch(() => {});
+                    } catch (error) {}
+                    return;
+                }
+                return originalPause.apply(this, arguments);
+            };
+            Object.defineProperty(prototype, 'pause', { configurable: true, writable: true, value: guardedPause });
+            Object.defineProperty(prototype, '__avBackgroundPauseGuardInstalled', { configurable: false, value: true });
+            return true;
+        };
+
+        try {
+            const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            if (patchPrototype(pageWindow.HTMLMediaElement && pageWindow.HTMLMediaElement.prototype)) return;
+        } catch (error) {}
+
+        const source = `(() => {
+            const prototype = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+            if (!prototype || prototype.__avBackgroundPauseGuardInstalled) return;
+            const originalPause = prototype.pause;
+            const guardedPause = function () {
+                if (this && this.dataset && this.dataset.avBackgroundKeepPlaying === '1' && !this.ended) {
+                    try {
+                        const playResult = this.play();
+                        if (playResult && typeof playResult.catch === 'function') playResult.catch(() => {});
+                    } catch (error) {}
+                    return;
+                }
+                return originalPause.apply(this, arguments);
+            };
+            Object.defineProperty(prototype, 'pause', { configurable: true, writable: true, value: guardedPause });
+            Object.defineProperty(prototype, '__avBackgroundPauseGuardInstalled', { configurable: false, value: true });
+        })();`;
+
+        try {
+            const target = document.documentElement || document.head || document.body;
+            if (!target) {
+                pageContextPauseGuardInstalled = false;
+                return;
+            }
+            const script = document.createElement('script');
+            script.textContent = source;
+            target.appendChild(script);
+            script.remove();
+        } catch (error) {
+            pageContextPauseGuardInstalled = false;
+        }
+    }
 
     function isPageHidden() {
         return document.hidden || document.visibilityState === 'hidden';
@@ -4741,14 +4806,14 @@
     function installBackgroundPlaybackGuard(video) {
         if (!video || video._avBackgroundPlaybackGuard) return;
         installBackgroundPlaybackLifecycle();
+        installPageContextPauseGuardBridge();
 
         const guard = {
             video,
             wasPlayingBeforeHidden: !video.paused && !video.ended,
             lastKnownPlaying: !video.paused && !video.ended,
             backgroundMode: false,
-            resumeAttempts: 0,
-            retryTimer: null,
+            keepAliveTimer: null,
             enterBackground() {
                 if (video.ended) return;
                 // blur 和 visibilitychange 可能连续触发，不能因第二次触发时
@@ -4757,43 +4822,57 @@
                 const wasPlaying = (!video.paused && !video.ended) || this.lastKnownPlaying;
                 this.wasPlayingBeforeHidden = wasPlaying;
                 this.backgroundMode = wasPlaying;
-                this.resumeAttempts = 0;
-                if (!wasPlaying) this.clearRetry();
+                if (wasPlaying) {
+                    video.dataset.avBackgroundKeepPlaying = '1';
+                    this.startKeepAlive();
+                } else {
+                    delete video.dataset.avBackgroundKeepPlaying;
+                    this.stopKeepAlive();
+                }
             },
             leaveBackground() {
                 const shouldResume = this.backgroundMode && shouldResumeBackgroundPlayback(video, this);
                 this.backgroundMode = false;
-                this.clearRetry();
-                this.resumeAttempts = 0;
+                delete video.dataset.avBackgroundKeepPlaying;
+                this.stopKeepAlive();
                 if (shouldResume) this.resume(false);
                 this.wasPlayingBeforeHidden = false;
                 this.lastKnownPlaying = !video.paused && !video.ended;
             },
-            clearRetry() {
-                if (this.retryTimer) {
-                    clearTimeout(this.retryTimer);
-                    this.retryTimer = null;
+            startKeepAlive() {
+                if (this.keepAliveTimer) return;
+                this.keepAliveTimer = setInterval(() => {
+                    if (!shouldKeepBackgroundPlayback(video, this)) {
+                        this.stopKeepAlive();
+                        return;
+                    }
+                    if (video.paused) this.resume();
+                }, 1000);
+            },
+            stopKeepAlive() {
+                if (this.keepAliveTimer) {
+                    clearInterval(this.keepAliveTimer);
+                    this.keepAliveTimer = null;
                 }
             },
-            resume(allowRetry) {
-                if (!shouldResumeBackgroundPlayback(video, this) || this.resumeAttempts >= 8) return;
-                this.resumeAttempts += 1;
-                let playResult;
+            resume() {
+                if (!shouldResumeBackgroundPlayback(video, this)) return;
                 try {
-                    playResult = video.play();
-                } catch (error) {
-                    playResult = Promise.reject(error);
-                }
-                if (playResult && typeof playResult.catch === 'function') {
-                    playResult.catch(() => {
-                        if (!allowRetry || !this.backgroundMode || !shouldResumeBackgroundPlayback(video, this)) return;
-                        this.clearRetry();
-                        this.retryTimer = setTimeout(() => {
-                            this.retryTimer = null;
-                            this.resume(true);
-                        }, 1000);
-                    });
-                }
+                    const playResult = video.play();
+                    if (playResult && typeof playResult.catch === 'function') playResult.catch(() => {});
+                } catch (error) {}
+            },
+            installPauseGuard() {
+                try {
+                    const originalPause = video.pause.bind(video);
+                    video.pause = () => {
+                        if (shouldKeepBackgroundPlayback(video, this)) {
+                            this.resume();
+                            return;
+                        }
+                        originalPause();
+                    };
+                } catch (error) {}
             },
             onPause() {
                 const hidden = isPageHidden();
@@ -4803,28 +4882,30 @@
                 if ((hidden || this.backgroundMode) && wasPlaying && !video.ended) {
                     this.wasPlayingBeforeHidden = true;
                     this.backgroundMode = true;
-                    this.resume(true);
+                    video.dataset.avBackgroundKeepPlaying = '1';
+                    this.startKeepAlive();
+                    this.resume();
                 }
             },
             onPlay() {
                 this.lastKnownPlaying = true;
-                this.clearRetry();
                 // 后台续播成功后保留 backgroundMode，避免浏览器再次暂停时丢失续播意图。
                 if (!this.backgroundMode) {
                     this.wasPlayingBeforeHidden = false;
-                    this.resumeAttempts = 0;
                 }
             },
             onEnded() {
                 this.backgroundMode = false;
                 this.wasPlayingBeforeHidden = false;
                 this.lastKnownPlaying = false;
-                this.clearRetry();
+                delete video.dataset.avBackgroundKeepPlaying;
+                this.stopKeepAlive();
             }
         };
 
         video._avBackgroundPlaybackGuard = guard;
         backgroundPlaybackGuards.add(guard);
+        guard.installPauseGuard();
         video.addEventListener('pause', guard.onPause, true);
         video.addEventListener('play', guard.onPlay, true);
         video.addEventListener('ended', guard.onEnded, true);
