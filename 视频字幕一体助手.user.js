@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.12.1
+// @version      2026.10.12.2
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -1439,56 +1439,85 @@
     }
 
     function request115CloudSearch(keyword) {
+        const params = new URLSearchParams({
+            search_value: keyword,
+            format: 'json',
+            aid: '1',
+            cid: '0',
+            offset: '0',
+            limit: '100',
+            type: '0'
+        })
+        const url = 'https://webapi.115.com/files/search?' + params.toString()
+        return request115JsonWithPageFallback('GET', url, undefined, 15000).then(data => {
+            const payload = data && data.data
+            return Array.isArray(payload)
+                ? payload
+                : Array.isArray(payload && payload.list)
+                    ? payload.list
+                    : Array.isArray(data && data.list)
+                        ? data.list
+                        : []
+        })
+    }
+
+    function get115PageFetch() {
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow && typeof unsafeWindow.fetch === 'function') return unsafeWindow.fetch.bind(unsafeWindow)
+        } catch (error) {}
+        try {
+            if (typeof window !== 'undefined' && typeof window.fetch === 'function') return window.fetch.bind(window)
+        } catch (error) {}
+        return null
+    }
+
+    function request115JsonFromPage(method, url, data, timeout) {
         return new Promise((resolve, reject) => {
-            if (typeof GM_xmlhttpRequest !== 'function') {
-                reject({ type: 'unsupported', message: '脚本没有 GM_xmlhttpRequest 权限' })
+            const pageFetch = get115PageFetch()
+            if (!pageFetch) {
+                reject({ type: 'network', status: 0, message: '当前页面没有可用的 115 fetch 会话' })
                 return
             }
-            const params = new URLSearchParams({
-                search_value: keyword,
-                format: 'json',
-                aid: '1',
-                cid: '0',
-                offset: '0',
-                limit: '100',
-                type: '0'
-            })
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: 'https://webapi.115.com/files/search?' + params.toString(),
-                anonymous: false,
-                withCredentials: true,
-                timeout: 15000,
-                headers: { Accept: 'application/json' },
-                onload: response => {
-                    let data
-                    try {
-                        data = JSON.parse(response.responseText || '{}')
-                    } catch (error) {
-                        reject({ type: 'auth', message: '当前浏览器没有可用的 115 登录状态' })
-                        return
+            const controller = typeof AbortController === 'function' ? new AbortController() : null
+            const timer = setTimeout(() => controller && controller.abort(), timeout || 20000)
+            const options = {
+                method: method || 'GET',
+                credentials: 'include',
+                headers: { Accept: 'application/json' }
+            }
+            if (controller) options.signal = controller.signal
+            if (data !== undefined && data !== null) {
+                options.body = data
+                options.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8'
+            }
+            pageFetch(url, options).then(async response => {
+                const text = await response.text()
+                let payload
+                try { payload = JSON.parse(text || '{}') } catch (error) {
+                    throw {
+                        type: 'server', status: Number(response.status) || 0,
+                        message: '115 返回的不是有效 JSON（HTTP ' + response.status + '）',
+                        responseText: String(text || '').slice(0, 180)
                     }
-                    if (is115LoginFailure(response, data)) {
-                        reject({ type: 'auth', message: '当前浏览器没有可用的 115 登录状态' })
-                        return
+                }
+                if (is115LoginFailure(response, payload)) {
+                    throw { type: 'auth', message: '当前 115 网页没有可用的登录状态' }
+                }
+                if (Number(response.status) >= 400 || payload.state === false || payload.state === 0) {
+                    throw {
+                        type: 'server', status: Number(response.status) || 0,
+                        message: payload.error_msg || payload.error || payload.message || payload.msg || ('115 请求失败（HTTP ' + response.status + '）'),
+                        response: payload
                     }
-                    if (Number(response.status) >= 400 || data.state === false || data.state === 0) {
-                        reject({ type: 'server', message: data.error_msg || data.error || '115 搜索接口返回异常' })
-                        return
-                    }
-                    const payload = data && data.data
-                    const list = Array.isArray(payload)
-                        ? payload
-                        : Array.isArray(payload && payload.list)
-                            ? payload.list
-                            : Array.isArray(data.list)
-                                ? data.list
-                                : []
-                    resolve(list)
-                },
-                ontimeout: () => reject({ type: 'network', message: '115 查询超时' }),
-                onerror: () => reject({ type: 'network', message: '115 查询失败（网络或跨域被拦截）' })
-            })
+                }
+                return payload
+            }).then(resolve).catch(error => {
+                if (error && error.name === 'AbortError') {
+                    reject({ type: 'network', status: 0, message: '115 网页请求超时' })
+                    return
+                }
+                reject(error && error.type ? error : { type: 'network', status: 0, message: '115 网页请求失败（登录态或跨域被拦截）', cause: error })
+            }).finally(() => clearTimeout(timer))
         })
     }
 
@@ -1504,7 +1533,7 @@
                 anonymous: false,
                 withCredentials: true,
                 timeout: timeout || 20000,
-                headers: { Accept: 'application/json' },
+                headers: { Accept: 'application/json', Referer: 'https://115.com/' },
                 onload: response => {
                     let payload
                     try {
@@ -1544,12 +1573,25 @@
         })
     }
 
+    async function request115JsonWithPageFallback(method, url, data, timeout) {
+        const isWebApi = /^https:\/\/webapi\.115\.com\//i.test(String(url || ''))
+        const is115Page = /(?:^|\.)115\.com$/i.test(String(location.hostname || ''))
+        if (isWebApi && is115Page) {
+            try {
+                return await request115JsonFromPage(method, url, data, timeout)
+            } catch (error) {
+                if (error && (error.type === 'auth' || error.type === 'server')) throw error
+            }
+        }
+        return request115Json(method, url, data, timeout)
+    }
+
     async function request115JsonWithRetry(method, url, data, timeout, attempts) {
         const maxAttempts = Math.max(1, Number(attempts) || 1)
         let lastError = null
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             try {
-                return await request115Json(method, url, data, timeout)
+                return await request115JsonWithPageFallback(method, url, data, timeout)
             } catch (error) {
                 lastError = error
                 if (error && error.type === 'auth') throw error
@@ -1640,7 +1682,7 @@
         const currentName = String(parent.parentName || '').split(/[\\/]/).filter(Boolean).pop() || ''
         if (currentName && get115FileNameKey(currentName) === get115FileNameKey(parentName)) return
         const body = new URLSearchParams([[ 'files_new_name[' + String(parent.parentCid) + ']', parentName ]]).toString()
-        await request115Json('POST', 'https://webapi.115.com/files/batch_rename', body)
+        await request115JsonWithPageFallback('POST', 'https://webapi.115.com/files/batch_rename', body)
         show115Notice('已同步：上级目录已改为“' + parentName + '”。', 'success', 6000)
     }
 
@@ -2264,7 +2306,7 @@
             aid: '1', cid: String(parentCid || '0'), o: 'file_name', asc: '1', offset: '0', show_dir: '1',
             limit: '1150', format: 'json', natsort: '1', fc_mix: '0'
         })
-        const payload = await request115Json('GET', 'https://webapi.115.com/files?' + params.toString())
+        const payload = await request115JsonWithPageFallback('GET', 'https://webapi.115.com/files?' + params.toString())
         return get115ListFromPayload(payload).map(normalize115File)
     }
 
@@ -2298,7 +2340,7 @@
         if (existing && existing.folderCid) return existing.folderCid
         const body = new URLSearchParams({ pid: String(parentCid || '0'), cname: folderName }).toString()
         try {
-            const payload = await request115Json('POST', 'https://webapi.115.com/files/add', body)
+            const payload = await request115JsonWithPageFallback('POST', 'https://webapi.115.com/files/add', body)
             const cid = get115FolderCidFromPayload(payload)
             if (cid) return cid
         } catch (error) {
@@ -2325,7 +2367,7 @@
 
     async function init115LocalSyncUpload(file, folderCid) {
         const body = new URLSearchParams({
-            filename: file.name, filesize: String(file.size || 0), target: 'U_1_' + String(folderCid), path: ''
+            userid: '', filename: file.name, filesize: String(file.size || 0), target: 'U_1_' + String(folderCid), path: ''
         }).toString()
         const payload = await request115JsonWithRetry('POST', 'https://uplb.115.com/3.0/sampleinitupload.php', body, 30000, 2)
         return get115UploadInitData(payload)
@@ -2408,13 +2450,13 @@
             pid: String(parentCid || item.parentCid || '0'),
             'fid[0]': String(item.fileId)
         }).toString()
-        await request115Json('POST', 'https://webapi.115.com/rb/delete', body)
+        await request115JsonWithPageFallback('POST', 'https://webapi.115.com/rb/delete', body)
     }
 
     async function rename115LocalSyncFile(item, name) {
         if (!item || !item.fileId) throw new Error('115没有返回临时字幕的文件ID，无法完成替换')
         const body = new URLSearchParams([[ 'files_new_name[' + String(item.fileId) + ']', String(name) ]]).toString()
-        await request115Json('POST', 'https://webapi.115.com/files/batch_rename', body)
+        await request115JsonWithPageFallback('POST', 'https://webapi.115.com/files/batch_rename', body)
     }
 
     async function uploadLocalSyncFile(result, folderCid, onProgress, replaceRemote, onCheck) {
