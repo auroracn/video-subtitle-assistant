@@ -45,4 +45,28 @@
 - Run the Node regression test, `node --check`, `git diff --check`, and SHA-256 comparison.
 
 - [ ] Verify source and repository copy, commit, push `main`, and confirm remote HEAD.
-- [ ] Keep live authenticated 115 upload verification explicitly unclaimed.
+- [x] Keep live authenticated 115 upload verification explicitly unclaimed.
+
+### Task 4: Cover the screenshot's cloud-download parent and the actual sync action
+
+**Files:** Modify `视频字幕一体助手.user.js`, `tests/115-local-sync.test.cjs`, and `README.md`.
+
+**Interfaces:** `resolve115LocalSyncFolder(code, records, remoteItems, targetCid)` returns a safe destination CID. `find115TopLevelCloudDownloadFolder(cid)` returns the root's actual cloud-download folder, optionally selecting it by CID. The local sync action accepts an empty target field for automatic resolution.
+
+- [x] Add and run regression tests through the actual sync action: two remote WMVs directly in cloud downloads and two missing local SRTs must create one numbered child and upload both subtitles; a video with an existing ordinary parent must upload the subtitle there without requiring a target CID.
+- [x] Correct the resolver with the following destination selection before its existing numbered-folder reuse/create branch:
+
+```javascript
+const existingVideoCid = find115LocalSyncVideoFolder(remoteItems, records, code)
+const parentCid = existingVideoCid || String(targetCid || '').trim()
+if (parentCid && (!/^\d+$/.test(parentCid) || parentCid === '0')) {
+    throw new Error('目标CID不能是115根目录；请选择“云下载”或其他已有目录')
+}
+const targetFolder = await find115TopLevelCloudDownloadFolder(parentCid)
+if (existingVideoCid && !targetFolder) return existingVideoCid
+```
+
+- [x] Allow an empty CID in the top-level cloud-download lookup by changing its ID predicate to `(!cid || String(item.folderCid) === String(cid))`. After the cloud-download branch, reject an empty resolved parent with `throw new Error('没有找到115根目录下的“云下载”文件夹，请选择其他已有目录CID')`; otherwise verify and reuse that non-root parent.
+- [x] Let the sync action reject only explicit invalid/root CIDs with `if (targetCid && (!/^\d+$/.test(targetCid) || targetCid === '0'))`. Persist the field when cleared, keep root CID invalid, and describe automatic existing-parent/cloud-download selection in its field help and README.
+- [x] Run `node --test tests/115-local-sync.test.cjs` and `node --check 视频字幕一体助手.user.js`; all 14 regression tests and syntax checks passed. The upload API is mocked; this verifies routing and guards, not authenticated ingestion. No create request targets root or a nested folder called cloud downloads. Source/repository SHA-256 equality and `git diff --check` also passed.
+- [ ] Synchronize the verified source and repository copy, verify SHA-256 equality and `git diff --check`, commit, and push `main`. Use per-command `git -c http.proxy= -c http.https://github.com.proxy=` for the unreachable local proxy; do not change global Git settings. Confirm the remote SHA equals local HEAD. Live authenticated upload remains unverified.

@@ -34,6 +34,7 @@ const declarations = [
     getDeclaration('get115FileNameKey'),
     getDeclaration('find115LocalSyncRemoteByRecord'),
     getDeclaration('find115LocalSyncMatches'),
+    getDeclaration('applyLocalSyncRemoteToSameName'),
     getDeclaration('getLocalSyncFolderName'),
     getDeclaration('find115LocalSyncVideoFolder'),
     getDeclaration('find115FolderByName'),
@@ -41,6 +42,11 @@ const declarations = [
     getDeclaration('ensure115LocalSyncFolder'),
     getDeclaration('resolve115LocalSyncFolder')
 ].join('\n')
+
+const syncStart = source.indexOf('        const syncItems = async items => {')
+const syncEnd = source.indexOf('        state.scanAndRender = async () => {', syncStart)
+assert.ok(syncStart >= 0 && syncEnd > syncStart, 'Missing local sync action')
+const syncAction = source.slice(syncStart, syncEnd)
 
 const context = vm.createContext({ URLSearchParams })
 vm.runInContext(`
@@ -71,6 +77,29 @@ vm.runInContext(`
         return String(payload && payload.data && payload.data.cid || '')
     }
 ` + declarations + `
+    async function runSyncItems(matches, targetCid) {
+        const uploads = []
+        const state = {
+            directories: [{}], matches, folderPromises: new Map(), syncing: false,
+            renderCurrent() {}, setStatusCurrent(message, level) {
+                state.message = message
+                state.level = level
+            }
+        }
+        const targetInput = { value: targetCid }
+        const updateButtons = () => {}
+        const isItemExcluded = item => Boolean(item.excluded)
+        const saveLocalSyncTargetCid = () => true
+        const notifyLocalSyncChanged = () => {}
+        const find115FileInFolder = async () => null
+        const uploadLocalSyncFile = async (item, cid) => {
+            uploads.push({ name: item.record.name, cid })
+            return { name: item.record.name, parentCid: cid, isVideo: item.record.kind === 'video' }
+        }
+` + syncAction + `
+        await syncItems(matches)
+        return { uploads, matches, message: state.message, level: state.level }
+    }
     globalThis.api = {
         folderChildren,
         folderCreateCalls,
@@ -79,6 +108,7 @@ vm.runInContext(`
         get115SearchKeywords,
         find115LocalSyncRemoteByRecord,
         find115LocalSyncMatches,
+        runSyncItems,
         setRemoteSearchItems,
         getLocalSyncFolderName,
         find115LocalSyncVideoFolder,
@@ -166,4 +196,73 @@ test('uses another existing non-root target directly and rejects root creation',
     await assert.rejects(api.resolve115LocalSyncFolder('030413-279', localVideos, [], '0'), /根目录/)
     await assert.rejects(api.ensure115LocalSyncFolder('0', '030413-279 title'), /禁止在115根目录创建/)
     await assert.rejects(api.ensure115LocalSyncFolder('20', '030413-279 title'), /只能在.*云下载/)
+})
+
+test('places missing subtitles in a numbered child when the remote videos are directly in cloud downloads', async () => {
+    api.folderChildren.set('0', [{ folderCid: '10', name: '云下载', isFolder: true }])
+    api.folderChildren.set('10', [])
+    api.setRemoteSearchItems(localVideos.slice(0, 2).map(record => ({
+        name: record.name, isVideo: true, isFolder: false, parentCid: '10'
+    })))
+    const before = api.folderCreateCalls.length
+    const matches = await api.find115LocalSyncMatches(localVideos.map(record => ({ ...record, code: '030413-279' })))
+    const result = await api.runSyncItems(matches, '')
+    assert.equal(result.level, 'ok', result.message)
+    assert.equal(api.folderCreateCalls.length, before + 1)
+    assert.equal(api.folderCreateCalls[before].parentCid, '10')
+    assert.deepEqual(Array.from(result.uploads, item => item.name), localVideos.slice(2).map(record => record.name))
+    assert.ok(result.uploads.every(item => item.cid === 'created-' + (before + 1)))
+    assert.ok(result.matches.every(item => item.exists))
+})
+
+test('syncs a missing subtitle to the existing video parent without requiring a target CID', async () => {
+    api.folderChildren.set('0', [{ folderCid: '10', name: '云下载', isFolder: true }])
+    api.setRemoteSearchItems([{ name: localVideos[0].name, isVideo: true, isFolder: false, parentCid: '70' }])
+    const before = api.folderCreateCalls.length
+    const matches = await api.find115LocalSyncMatches([localVideos[2]].map(record => ({ ...record, code: '030413-279' })))
+    const result = await api.runSyncItems(matches, '')
+    assert.equal(result.level, 'ok', result.message)
+    assert.equal(result.uploads.length, 1)
+    assert.equal(result.uploads[0].cid, '70')
+    assert.equal(api.folderCreateCalls.length, before)
+})
+
+test('automatically uses top-level cloud downloads when no target or remote parent is available', async () => {
+    api.folderChildren.set('0', [{ folderCid: '10', name: '云下载', isFolder: true }])
+    api.folderChildren.set('10', [])
+    const before = api.folderCreateCalls.length
+    assert.equal(await api.resolve115LocalSyncFolder('030413-279', localVideos, [], ''), 'created-' + (before + 1))
+    assert.equal(api.folderCreateCalls[before].parentCid, '10')
+})
+
+test('refuses an unknown default destination and never creates under a nested folder named cloud downloads', async () => {
+    api.folderChildren.set('0', [])
+    api.folderChildren.set('20', [{ folderCid: '21', name: '云下载', isFolder: true }])
+    const before = api.folderCreateCalls.length
+    await assert.rejects(api.resolve115LocalSyncFolder('030413-279', localVideos, [], ''), /云下载/)
+    await assert.rejects(api.ensure115LocalSyncFolder('21', '030413-279 title'), /只能在.*云下载/)
+    assert.equal(api.folderCreateCalls.length, before)
+})
+
+test('uses the remote video title for a new cloud-download child when only local subtitles are selected', async () => {
+    api.folderChildren.set('0', [{ folderCid: '10', name: '云下载', isFolder: true }])
+    api.folderChildren.set('10', [])
+    const remoteVideos = localVideos.slice(0, 2).map(record => ({
+        name: record.name, isVideo: true, isFolder: false, parentCid: '10'
+    }))
+    const before = api.folderCreateCalls.length
+    const cid = await api.resolve115LocalSyncFolder('030413-279', localVideos.slice(2), remoteVideos, '20')
+    assert.equal(cid, 'created-' + (before + 1))
+    assert.equal(api.folderCreateCalls[before].parentCid, '10')
+    assert.equal(api.folderCreateCalls[before].name, '030413-279 義母の筆下ろし教育')
+})
+
+test('blocks an explicitly selected root CID before creating a folder or uploading a file', async () => {
+    const before = api.folderCreateCalls.length
+    const matches = [{ record: { ...localVideos[2], code: '030413-279' }, exists: false, status: 'pending' }]
+    const result = await api.runSyncItems(matches, '0')
+    assert.equal(result.level, 'error')
+    assert.match(result.message, /根目录/)
+    assert.equal(result.uploads.length, 0)
+    assert.equal(api.folderCreateCalls.length, before)
 })
