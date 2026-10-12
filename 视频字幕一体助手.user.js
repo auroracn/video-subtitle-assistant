@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.11.3
+// @version      2026.10.12.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -1756,9 +1756,44 @@
             ? data
             : Array.isArray(data && data.list)
                 ? data.list
+                : Array.isArray(data && data.data)
+                    ? data.data
                 : Array.isArray(payload && payload.list)
                     ? payload.list
                     : []
+    }
+
+    function get115FolderCidFromPayload(payload) {
+        const candidates = []
+        const add = value => {
+            if (value === undefined || value === null) return
+            const text = String(value).trim()
+            if (text) candidates.push(text)
+        }
+        const addObject = value => {
+            if (!value || typeof value !== 'object') return
+            ;['cid', 'file_id', 'cate_id', 'folder_id', 'category_id'].forEach(key => add(value[key]))
+        }
+        addObject(payload)
+        const data = payload && payload.data
+        addObject(data)
+        if (Array.isArray(data)) data.forEach(addObject)
+        else if (data && Array.isArray(data.data)) data.data.forEach(addObject)
+        const cid = candidates.find(value => /^\d+$/.test(value))
+        return cid || ''
+    }
+
+    function is115FolderItem(item) {
+        if (!item || typeof item !== 'object') return false
+        const fileType = item.file_type ?? item.fileType ?? item.kind
+        const dirFlag = item.is_dir ?? item.is_folder ?? item.is_directory
+        if (dirFlag === true || String(dirFlag) === '1') return true
+        if (['0', 'folder', 'dir', 'directory'].includes(String(fileType ?? '').toLowerCase())) return true
+        // 115旧网页接口用 {cid, n} 表示目录、用 {fid, n} 表示文件。
+        const folderId = item.cid ?? item.category_id ?? item.cate_id ?? item.folder_id
+        const fileId = item.file_id ?? item.fid ?? item.fileId
+        return folderId !== undefined && folderId !== null && String(folderId).trim() !== '' &&
+            (fileId === undefined || fileId === null || String(fileId).trim() === '')
     }
 
     function normalize115File(item) {
@@ -1768,10 +1803,7 @@
         const sizeBytes = parse115SizeBytes(sizeValue)
         const path = String(item && (item.parent_name || item.path || item.parent_path) || '').trim()
         const parentName = String(item && (item.parent_name || item.parentName) || '').trim()
-        const fileType = item && (item.file_type ?? item.fileType ?? item.kind)
-        const dirFlag = item && (item.is_dir ?? item.is_folder ?? item.is_directory)
-        const isFolder = dirFlag === true || String(dirFlag) === '1' ||
-            ['0', 'folder', 'dir', 'directory'].includes(String(fileType ?? '').toLowerCase())
+        const isFolder = is115FolderItem(item)
         const mime = String(item && (item.mime_type || item.mime || item.content_type || item.category) || '').toLowerCase()
         const lowerName = name.toLowerCase()
         const isImage = /\.(?:jpe?g|png|gif|webp|bmp|svg|avif|heic|tiff?)(?:$|[?#])/i.test(lowerName) ||
@@ -2267,9 +2299,8 @@
         const body = new URLSearchParams({ pid: String(parentCid || '0'), cname: folderName }).toString()
         try {
             const payload = await request115Json('POST', 'https://webapi.115.com/files/add', body)
-            const data = payload && payload.data
-            const cid = payload.cid || (data && data.cid) || (data && data[0] && data[0].cid)
-            if (cid !== undefined && cid !== null && String(cid).trim()) return String(cid).trim()
+            const cid = get115FolderCidFromPayload(payload)
+            if (cid) return cid
         } catch (error) {
             const text = JSON.stringify(error && (error.response || error.message || error))
             if (!/已存在|20004|already/i.test(text)) throw error
