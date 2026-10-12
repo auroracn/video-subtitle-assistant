@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.12.2
+// @version      2026.10.12.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -1416,9 +1416,18 @@
     // ==================== 115 网盘番号查找 ====================
     // 只查询当前浏览器可用的 115 登录态，不会自动转存或下载。
     function get115SearchKeywords(code) {
-        const match = String(code || '').match(/^([A-Za-z]{2,8})[-_ ]?(\d{1,8})/)
+        const value = String(code || '')
+        const numberPair = value.match(/^(\d{4,8})[-_ ](\d{2,5})(?:$|[^A-Za-z0-9])/)
+        if (numberPair) {
+            return {
+                exact: numberPair[1] + '-' + numberPair[2],
+                fallback: numberPair[1] + ' ' + numberPair[2],
+                display: numberPair[1] + '-' + numberPair[2]
+            }
+        }
+        const match = value.match(/^([A-Za-z]{2,8})[-_ ]?(\d{1,8})/)
         if (!match) {
-            const numberOnly = String(code || '').match(/^(\d{2,8})/)
+            const numberOnly = value.match(/^(\d{2,8})/)
             if (!numberOnly) return { exact: '', fallback: '', display: '' }
             return { exact: numberOnly[1], fallback: numberOnly[1], display: numberOnly[1] }
         }
@@ -1990,6 +1999,7 @@
     const LOCAL_SYNC_VIDEO_EXTENSIONS = /\.(mp4|m4v|mkv|wmv|avi|mov|flv|ts|m2ts|webm|mpeg|mpg|3gp|rmvb|vob)$/i
     const LOCAL_SYNC_SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|vtt|sup)$/i
     const LOCAL_SYNC_CODE_RE = /(^|[^A-Za-z0-9])([A-Za-z]{2,10})[-_ ]?(\d{2,8})(?=[^A-Za-z0-9]|$)/i
+    const LOCAL_SYNC_NUMBER_PAIR_RE = /(^|[^A-Za-z0-9])(\d{4,8})[-_ ](\d{2,5})(?=[^A-Za-z0-9]|$)/
     const LOCAL_SYNC_NUMBER_RE = /(^|[^A-Za-z0-9])(\d{2,8})(?=[^A-Za-z0-9]|$)/i
     const LOCAL_SYNC_TARGET_CID_KEY = 'missav-115-local-sync-target-cid'
     const LOCAL_SYNC_HIDE_EXISTING_KEY = 'missav-115-local-sync-hide-existing'
@@ -2085,6 +2095,8 @@
         const text = String(name || '')
         const match = text.match(LOCAL_SYNC_CODE_RE)
         if (match) return normalizeLocalSyncCode(match[2], match[3])
+        const numberPair = text.match(LOCAL_SYNC_NUMBER_PAIR_RE)
+        if (numberPair) return numberPair[2] + '-' + numberPair[3]
         const numberOnly = text.match(LOCAL_SYNC_NUMBER_RE)
         return numberOnly ? numberOnly[2] : ''
     }
@@ -2167,15 +2179,16 @@
     function getLocalSyncTargetCid() {
         try {
             const value = typeof GM_getValue === 'function'
-                ? GM_getValue(LOCAL_SYNC_TARGET_CID_KEY, '0')
-                : localStorage.getItem(LOCAL_SYNC_TARGET_CID_KEY) || '0'
-            return /^\d+$/.test(String(value || '').trim()) ? String(value).trim() : '0'
-        } catch (error) { return '0' }
+                ? GM_getValue(LOCAL_SYNC_TARGET_CID_KEY, '')
+                : localStorage.getItem(LOCAL_SYNC_TARGET_CID_KEY) || ''
+            const cid = String(value || '').trim()
+            return /^\d+$/.test(cid) && cid !== '0' ? cid : ''
+        } catch (error) { return '' }
     }
 
     function saveLocalSyncTargetCid(value) {
         const cid = String(value || '').trim()
-        if (!/^\d+$/.test(cid)) return false
+        if (!/^\d+$/.test(cid) || cid === '0') return false
         try {
             if (typeof GM_setValue === 'function') GM_setValue(LOCAL_SYNC_TARGET_CID_KEY, cid)
             else localStorage.setItem(LOCAL_SYNC_TARGET_CID_KEY, cid)
@@ -2262,13 +2275,39 @@
 
     function find115LocalSyncRemoteByRecord(items, record) {
         const list = (Array.isArray(items) ? items : []).filter(item => item && !item.isFolder)
-        const exact = find115LocalSyncRemoteByName(list, record && record.name)
-        if (exact) return exact
-        const code = String(record && record.code || extractLocalSyncCodeFromName(record && record.name) || '')
-        if (!code) return null
-        return list
-            .filter(item => extractLocalSyncCodeFromName(item.name) === code)
-            .reduce((best, item) => prefer115LocalSyncRemote(best, item), null)
+        const expectedKind = record && record.kind
+        return list.find(item =>
+            get115FileNameKey(item.name) === get115FileNameKey(record && record.name) &&
+            (expectedKind === 'video' ? item.isVideo : !item.isVideo)
+        ) || null
+    }
+
+    function getLocalSyncFolderName(records, code) {
+        const names = (Array.isArray(records) ? records : [])
+            .filter(record => record && record.kind === 'video')
+            .map(record => String(record.name || '').replace(/\.[^.]+$/, '').trim())
+            .filter(Boolean)
+            .map(name => name.replace(/\s+[-_]?\s*\d{1,3}$/, '').trim())
+            .filter(Boolean)
+        names.sort((a, b) => a.length - b.length || a.localeCompare(b))
+        return names[0] || String(code || '').trim()
+    }
+
+    function find115LocalSyncVideoFolder(items, records, code) {
+        const remoteVideos = (Array.isArray(items) ? items : []).filter(item =>
+            item && !item.isFolder && item.isVideo &&
+            extractLocalSyncCodeFromName(item.name) === String(code || '') &&
+            /^\d+$/.test(String(item.parentCid || '')) && String(item.parentCid) !== '0'
+        )
+        if (!remoteVideos.length) return ''
+        const localVideos = (Array.isArray(records) ? records : []).filter(record => record && record.kind === 'video')
+        const exact = remoteVideos.find(remote => localVideos.some(local =>
+            get115FileNameKey(local.name) === get115FileNameKey(remote.name)
+        ))
+        if (exact) return String(exact.parentCid)
+        const counts = new Map()
+        remoteVideos.forEach(item => counts.set(String(item.parentCid), (counts.get(String(item.parentCid)) || 0) + 1))
+        return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0][0]
     }
 
     async function find115LocalSyncMatches(records, onProgress) {
@@ -2315,6 +2354,12 @@
         return items.find(item => item.isFolder && get115FileNameKey(item.name) === get115FileNameKey(folderName)) || null
     }
 
+    async function find115TopLevelCloudDownloadFolder(cid) {
+        const rootItems = await request115FolderChildren('0')
+        return rootItems.find(item => item && item.isFolder && String(item.folderCid) === String(cid) &&
+            get115FileNameKey(item.name) === get115FileNameKey('云下载')) || null
+    }
+
     function find115SubtitleFolderFromNormalizedResults(items, folderName) {
         const normalizeName = value => String(value || '').trim().replace(/\s+/g, ' ').toUpperCase()
         const expectedName = normalizeName(folderName)
@@ -2336,6 +2381,12 @@
     }
 
     async function ensure115LocalSyncFolder(parentCid, folderName) {
+        if (!/^\d+$/.test(String(parentCid || '')) || String(parentCid) === '0') {
+            throw new Error('禁止在115根目录创建番号文件夹，请选择“云下载”目录')
+        }
+        if (!await find115TopLevelCloudDownloadFolder(parentCid)) {
+            throw new Error('只能在115根目录下的“云下载”文件夹中创建番号文件夹')
+        }
         const existing = await find115FolderByName(parentCid, folderName)
         if (existing && existing.folderCid) return existing.folderCid
         const body = new URLSearchParams({ pid: String(parentCid || '0'), cname: folderName }).toString()
@@ -2350,6 +2401,31 @@
         const afterCreate = await find115FolderByName(parentCid, folderName)
         if (afterCreate && afterCreate.folderCid) return afterCreate.folderCid
         throw new Error('无法找到或创建 115 文件夹：' + folderName)
+    }
+
+    async function resolve115LocalSyncFolder(code, records, remoteItems, targetCid) {
+        const existingVideoCid = find115LocalSyncVideoFolder(remoteItems, records, code)
+        if (existingVideoCid) return existingVideoCid
+        if (!/^\d+$/.test(String(targetCid || '')) || String(targetCid) === '0') {
+            throw new Error('目标CID不能是115根目录；请选择“云下载”或其他已有目录')
+        }
+
+        const targetFolder = await find115TopLevelCloudDownloadFolder(targetCid)
+        if (targetFolder) {
+            const cloudItems = await request115FolderChildren(targetFolder.folderCid)
+            const folderName = getLocalSyncFolderName(records, code)
+            const sameNumberFolders = cloudItems.filter(item => item && item.isFolder &&
+                extractLocalSyncCodeFromName(item.name) === String(code || '')
+            )
+            const existing = sameNumberFolders.find(item => get115FileNameKey(item.name) === get115FileNameKey(folderName))
+            if (existing && existing.folderCid) return String(existing.folderCid)
+            if (sameNumberFolders.length === 1 && sameNumberFolders[0].folderCid) return String(sameNumberFolders[0].folderCid)
+            if (sameNumberFolders.length > 1) throw new Error('“云下载”下有多个同番号文件夹，请先在目标CID中选择正确的已有文件夹')
+            return ensure115LocalSyncFolder(targetFolder.folderCid, folderName)
+        }
+
+        await request115FolderChildren(targetCid)
+        return String(targetCid)
     }
 
     function get115UploadInitData(payload) {
@@ -2849,8 +2925,8 @@
         const targetInput = document.createElement('input')
         targetInput.className = 'missav-115-local-input'
         targetInput.value = getLocalSyncTargetCid()
-        targetInput.placeholder = '根目录填 0'
-        targetInput.title = '115目标文件夹的CID；根目录为0，可从115目录地址中的cid复制'
+        targetInput.placeholder = '填“云下载”或已有目录CID'
+        targetInput.title = '选择115“云下载”目录可按番号创建子目录；其他已有目录直接作为上传位置；禁止选择根目录CID 0'
         targetRow.append(targetLabel, targetInput)
         controls.appendChild(targetRow)
         const syncRow = document.createElement('div')
@@ -2902,7 +2978,7 @@
         card.appendChild(list)
         const hint = document.createElement('div')
         hint.className = 'missav-115-local-hint'
-        hint.textContent = '仅手动扫描；新添加目录默认最高优先级。同步后会直接核对目标文件夹，网页上传记录可能不显示，以文件夹中的实际文件为准。改名开关只处理115内的视频文件。'
+        hint.textContent = '仅手动扫描；新添加目录默认最高优先级。仅在“云下载”下创建番号文件夹，其他已有目录直接作为上传位置，禁止使用根目录。同步后以目标文件夹中的实际文件为准。改名开关只处理115内的视频文件。'
         card.appendChild(hint)
         toggle.addEventListener('click', event => {
             if (toggle.dataset.dragMoved === '1') {
@@ -3196,7 +3272,7 @@
         const syncItems = async items => {
             if (state.syncing || !state.directories.length) return
             const targetCid = String(targetInput.value || '').trim()
-            if (!/^\d+$/.test(targetCid)) { state.setStatusCurrent('目标CID必须是数字，根目录填 0', 'error'); return }
+            if (!/^\d+$/.test(targetCid) || targetCid === '0') { state.setStatusCurrent('目标CID必须是非零数字；请选择“云下载”或其他已有目录', 'error'); return }
             saveLocalSyncTargetCid(targetCid)
             state.syncing = true
             updateButtons()
@@ -3214,7 +3290,10 @@
                         }
                         let folderPromise = state.folderPromises.get(item.record.code)
                         if (!folderPromise) {
-                            folderPromise = ensure115LocalSyncFolder(targetCid, item.record.code)
+                            const groupRecords = state.matches
+                                .filter(match => match.record.code === item.record.code)
+                                .map(match => match.record)
+                            folderPromise = resolve115LocalSyncFolder(item.record.code, groupRecords, freshItems, targetCid)
                             state.folderPromises.set(item.record.code, folderPromise)
                         }
                         const folderCid = await folderPromise
@@ -3285,7 +3364,7 @@
         })
         rescanButton.addEventListener('click', () => state.scanAndRender())
         targetInput.addEventListener('change', () => {
-            if (!saveLocalSyncTargetCid(targetInput.value)) { targetInput.value = getLocalSyncTargetCid(); setStatus('目标CID必须是数字，根目录填 0', 'error') }
+            if (!saveLocalSyncTargetCid(targetInput.value)) { targetInput.value = getLocalSyncTargetCid(); setStatus('目标CID必须是非零数字；根目录不允许作为同步目标', 'error') }
         })
         syncSelected.addEventListener('click', () => syncItems(state.matches.filter(item => item.selected && !item.exists && !isItemExcluded(item))))
         syncAll.addEventListener('click', () => syncItems(getPending()))
