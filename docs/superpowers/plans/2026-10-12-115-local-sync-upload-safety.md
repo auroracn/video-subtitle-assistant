@@ -44,7 +44,7 @@
 - Copy verified userscript to `视频字幕一体助手.user.js` in the public repository.
 - Run the Node regression test, `node --check`, `git diff --check`, and SHA-256 comparison.
 
-- [ ] Verify source and repository copy, commit, push `main`, and confirm remote HEAD.
+- [x] Verify source and repository copy, commit, push `main`, and confirm remote HEAD.
 - [x] Keep live authenticated 115 upload verification explicitly unclaimed.
 
 ### Task 4: Cover the screenshot's cloud-download parent and the actual sync action
@@ -69,4 +69,4 @@ if (existingVideoCid && !targetFolder) return existingVideoCid
 - [x] Allow an empty CID in the top-level cloud-download lookup by changing its ID predicate to `(!cid || String(item.folderCid) === String(cid))`. After the cloud-download branch, reject an empty resolved parent with `throw new Error('没有找到115根目录下的“云下载”文件夹，请选择其他已有目录CID')`; otherwise verify and reuse that non-root parent.
 - [x] Let the sync action reject only explicit invalid/root CIDs with `if (targetCid && (!/^\d+$/.test(targetCid) || targetCid === '0'))`. Persist the field when cleared, keep root CID invalid, and describe automatic existing-parent/cloud-download selection in its field help and README.
 - [x] Run `node --test tests/115-local-sync.test.cjs` and `node --check 视频字幕一体助手.user.js`; all 14 regression tests and syntax checks passed. The upload API is mocked; this verifies routing and guards, not authenticated ingestion. No create request targets root or a nested folder called cloud downloads. Source/repository SHA-256 equality and `git diff --check` also passed.
-- [ ] Synchronize the verified source and repository copy, verify SHA-256 equality and `git diff --check`, commit, and push `main`. Use per-command `git -c http.proxy= -c http.https://github.com.proxy=` for the unreachable local proxy; do not change global Git settings. Confirm the remote SHA equals local HEAD. Live authenticated upload remains unverified.
+- [x] Synchronize the verified source and repository copy, verify SHA-256 equality and `git diff --check`, commit, and push `main`. Per-command `git -c http.proxy= -c http.https://github.com.proxy=` bypassed the unreachable local proxy without changing global Git settings. Published implementation commit `023c8428d69161b9eaf4fcbc3047cb4730a45a12` matched remote `main`. Live authenticated upload remains unverified.
