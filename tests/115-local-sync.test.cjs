@@ -41,6 +41,7 @@ const declarations = [
     getDeclaration('get115SearchKeywords'),
     getDeclaration('get115FileNameKey'),
     getDeclaration('find115LocalSyncRemoteByRecord'),
+    getDeclaration('find115LocalSyncScopedRemoteByRecord'),
     getDeclaration('find115LocalSyncMatches'),
     getDeclaration('applyLocalSyncRemoteToSameName'),
     getDeclaration('getLocalSyncFolderName'),
@@ -54,9 +55,12 @@ const declarations = [
 
 const taskDeclarations = [
     getDeclaration('getLocalSyncRecordKey'),
+    getDeclaration('serializeLocalSyncRecord'),
     getDeclaration('serializeLocalSyncTaskItem'),
     getDeclarationOrUnimplemented('createLocalSyncTask'),
     getDeclarationOrUnimplemented('restoreLocalSyncTask'),
+    getDeclarationOrUnimplemented('createLocalSyncScan'),
+    getDeclarationOrUnimplemented('restoreLocalSyncScan'),
     getDeclarationOrUnimplemented('ensureLocalSyncTask'),
     getDeclarationOrUnimplemented('snapshotLocalSyncTask')
 ].join('\n')
@@ -98,6 +102,7 @@ vm.runInContext(`
         return String(payload && payload.data && payload.data.cid || '')
     }
     async function saveLocalSyncTask() {}
+    async function saveLocalSyncScan() {}
     async function clearLocalSyncTask() {}
 ` + declarations + `
 ` + taskDeclarations + `
@@ -131,6 +136,7 @@ vm.runInContext(`
         extractLocalSyncCodeFromName,
         get115SearchKeywords,
         find115LocalSyncRemoteByRecord,
+        find115LocalSyncScopedRemoteByRecord,
         find115LocalSyncMatches,
         runSyncItems,
         setRemoteSearchItems,
@@ -140,6 +146,8 @@ vm.runInContext(`
         resolve115LocalSyncFolder
         ,createLocalSyncTask
         ,restoreLocalSyncTask
+        ,createLocalSyncScan
+        ,restoreLocalSyncScan
         ,waitFor115FileInFolder
     }
 `, context)
@@ -197,6 +205,38 @@ test('stops polling when 115 never confirms the uploaded file', async () => {
     assert.equal(checks, 3)
 })
 
+test('restores the scanned card list without serializing transient File objects', () => {
+    const fileHandle = { kind: 'file', name: '030413-279.srt' }
+    const record = {
+        file: { transient: true },
+        fileHandle,
+        name: '030413-279.srt',
+        relativePath: 'sub/030413-279.srt',
+        sourceName: '字幕目录',
+        sourceIndex: 0,
+        code: '030413-279',
+        kind: 'subtitle',
+        size: 123,
+        lastModified: 456
+    }
+    const scan = api.createLocalSyncScan([record], [{
+        record,
+        status: 'pending',
+        selected: true,
+        replaceExisting: false,
+        exists: false
+    }])
+    assert.equal(scan.version, 1)
+    assert.equal(scan.records.length, 1)
+    assert.equal(scan.matches.length, 1)
+    assert.equal(scan.records[0].file, undefined)
+    assert.equal(scan.matches[0].record.file, undefined)
+    const restored = api.restoreLocalSyncScan(scan)
+    assert.equal(restored.records[0].fileHandle, fileHandle)
+    assert.equal(restored.matches[0].record.fileHandle, fileHandle)
+    assert.equal(restored.matches[0].status, 'pending')
+})
+
 test('keeps numeric hyphenated numbers intact for parsing and search', () => {
     assert.equal(api.extractLocalSyncCodeFromName(localVideos[0].name), '030413-279')
     assert.deepEqual(JSON.parse(JSON.stringify(api.get115SearchKeywords('030413-279'))), {
@@ -212,6 +252,17 @@ test('does not let a remote video or another episode satisfy a subtitle/video ro
     assert.equal(api.find115LocalSyncRemoteByRecord(remoteVideos, localVideos[2]), null)
     assert.equal(api.find115LocalSyncRemoteByRecord(remoteVideos.slice(0, 1), localVideos[1]), null)
     assert.equal(api.find115LocalSyncRemoteByRecord(remoteVideos, localVideos[0]).name, localVideos[0].name)
+})
+
+test('does not treat a same-name subtitle in another remote folder as existing', () => {
+    const remoteItems = [
+        { name: localVideos[0].name, isVideo: true, isFolder: false, parentCid: '70' },
+        { name: localVideos[2].name, isVideo: false, isFolder: false, parentCid: '99' }
+    ]
+    assert.equal(
+        api.find115LocalSyncScopedRemoteByRecord(remoteItems, localVideos[2], localVideos, '030413-279'),
+        null
+    )
 })
 
 test('marks both remote WMVs as existing while keeping both missing SRT rows pending', async () => {
