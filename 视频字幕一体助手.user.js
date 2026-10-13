@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.12.3
+// @version      2026.10.13.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -1995,6 +1995,11 @@
     const LOCAL_SYNC_STORE = 'state'
     const LOCAL_SYNC_HANDLE_KEY = 'directory-handle'
     const LOCAL_SYNC_HANDLES_KEY = 'directory-handles'
+    const LOCAL_SYNC_TASK_KEY = 'sync-task-v1'
+    const LOCAL_SYNC_TASK_VERSION = 1
+    const LOCAL_SYNC_CONFIRM_INTERVAL = 60000
+    const LOCAL_SYNC_CONFIRM_MAX_ATTEMPTS = 10
+    const LOCAL_SYNC_UPLOAD_TIMEOUT = 1800000
     const LOCAL_SYNC_CHANNEL = 'missav-115-local-sync-v1'
     const LOCAL_SYNC_VIDEO_EXTENSIONS = /\.(mp4|m4v|mkv|wmv|avi|mov|flv|ts|m2ts|webm|mpeg|mpg|3gp|rmvb|vob)$/i
     const LOCAL_SYNC_SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|vtt|sup)$/i
@@ -2064,6 +2069,35 @@
             request.onerror = () => reject(request.error || new Error('无法读取本地目录授权'))
             tx.oncomplete = () => db.close()
             tx.onerror = () => { db.close(); reject(tx.error || new Error('无法读取本地目录授权')) }
+        }))
+    }
+
+    function saveLocalSyncTask(task) {
+        return openLocalSyncDb().then(db => new Promise((resolve, reject) => {
+            const tx = db.transaction(LOCAL_SYNC_STORE, 'readwrite')
+            tx.objectStore(LOCAL_SYNC_STORE).put(task, LOCAL_SYNC_TASK_KEY)
+            tx.oncomplete = () => { db.close(); resolve() }
+            tx.onerror = () => { const error = tx.error || new Error('无法保存本地同步任务'); db.close(); reject(error) }
+        }))
+    }
+
+    function loadLocalSyncTask() {
+        return openLocalSyncDb().then(db => new Promise((resolve, reject) => {
+            const tx = db.transaction(LOCAL_SYNC_STORE, 'readonly')
+            const request = tx.objectStore(LOCAL_SYNC_STORE).get(LOCAL_SYNC_TASK_KEY)
+            request.onsuccess = () => resolve(request.result || null)
+            request.onerror = () => reject(request.error || new Error('无法读取本地同步任务'))
+            tx.oncomplete = () => db.close()
+            tx.onerror = () => { db.close(); reject(tx.error || new Error('无法读取本地同步任务')) }
+        }))
+    }
+
+    function clearLocalSyncTask() {
+        return openLocalSyncDb().then(db => new Promise((resolve, reject) => {
+            const tx = db.transaction(LOCAL_SYNC_STORE, 'readwrite')
+            tx.objectStore(LOCAL_SYNC_STORE).delete(LOCAL_SYNC_TASK_KEY)
+            tx.oncomplete = () => { db.close(); resolve() }
+            tx.onerror = () => { const error = tx.error || new Error('无法清除本地同步任务'); db.close(); reject(error) }
         }))
     }
 
@@ -2224,6 +2258,111 @@
         return [record.sourceName || '', record.relativePath || record.name || '', record.name || '']
             .map(value => get115FileNameKey(value))
             .join('|')
+    }
+
+    function serializeLocalSyncTaskItem(item) {
+        const source = item && item.record || {}
+        const record = {
+            fileHandle: source.fileHandle || null,
+            name: String(source.name || ''),
+            relativePath: String(source.relativePath || source.name || ''),
+            sourceName: String(source.sourceName || ''),
+            sourceIndex: Number.isInteger(source.sourceIndex) ? source.sourceIndex : 0,
+            code: String(source.code || ''),
+            kind: String(source.kind || ''),
+            size: Number(source.size) || 0,
+            lastModified: Number(source.lastModified) || 0
+        }
+        return {
+            key: getLocalSyncRecordKey(record),
+            record: record,
+            status: String(item && item.status || 'pending'),
+            selected: item ? item.selected !== false : true,
+            replaceExisting: Boolean(item && item.replaceExisting),
+            exists: Boolean(item && (item.exists || item.status === 'exists' || item.status === 'synced')),
+            remote: item && item.remote ? {
+                name: item.remote.name,
+                fileId: item.remote.fileId,
+                parentCid: item.remote.parentCid,
+                sizeBytes: item.remote.sizeBytes,
+                pickCode: item.remote.pickCode,
+                isVideo: item.remote.isVideo,
+                isFolder: item.remote.isFolder
+            } : null,
+            folderCid: String(item && item.folderCid || ''),
+            uploadName: String(item && item.uploadName || ''),
+            error: String(item && item.error || '')
+        }
+    }
+
+    function createLocalSyncTask(items, targetCid) {
+        const now = Date.now()
+        return {
+            version: LOCAL_SYNC_TASK_VERSION,
+            status: 'running',
+            targetCid: String(targetCid || ''),
+            createdAt: now,
+            updatedAt: now,
+            items: (Array.isArray(items) ? items : []).map(serializeLocalSyncTaskItem)
+        }
+    }
+
+    function restoreLocalSyncTask(task) {
+        const rawItems = task && Array.isArray(task.items) ? task.items : []
+        return rawItems.map(saved => {
+            const record = Object.assign({}, saved && saved.record || {})
+            const status = saved && saved.status === 'syncing' ? 'pending' : String(saved && saved.status || 'pending')
+            return {
+                record: record,
+                status: status,
+                selected: !saved || saved.selected !== false,
+                replaceExisting: Boolean(saved && saved.replaceExisting),
+                exists: Boolean(saved && (saved.exists || status === 'exists' || status === 'synced')),
+                remote: saved && saved.remote || null,
+                folderCid: String(saved && saved.folderCid || ''),
+                uploadName: String(saved && saved.uploadName || ''),
+                error: String(saved && saved.error || '')
+            }
+        })
+    }
+
+    async function getLocalSyncFileHandleByPath(directoryHandle, relativePath) {
+        const parts = String(relativePath || '').split(/[\\/]+/).filter(Boolean)
+        if (!directoryHandle || !parts.length) throw new Error('本地同步任务缺少文件路径')
+        let current = directoryHandle
+        for (const part of parts.slice(0, -1)) current = await current.getDirectoryHandle(part)
+        return await current.getFileHandle(parts[parts.length - 1])
+    }
+
+    async function hydrateLocalSyncTask(task, directories, requestPermission) {
+        const restored = restoreLocalSyncTask(task)
+        for (const item of restored) {
+            let fileHandle = item.record.fileHandle
+            let file = null
+            try {
+                if (fileHandle && await hasLocalSyncPermission(fileHandle, Boolean(requestPermission))) file = await fileHandle.getFile()
+            } catch (error) {}
+            if (!file) {
+                const entry = Array.isArray(directories) ? directories[item.record.sourceIndex] : null
+                const directoryHandle = entry && entry.handle ? entry.handle : entry
+                try {
+                    if (directoryHandle && await hasLocalSyncPermission(directoryHandle, Boolean(requestPermission))) {
+                        fileHandle = await getLocalSyncFileHandleByPath(directoryHandle, item.record.relativePath)
+                        file = await fileHandle.getFile()
+                    }
+                } catch (error) {}
+            }
+            if (!file || !fileHandle) {
+                item.status = 'failed'
+                item.error = '刷新后无法读取本地文件，请重新授权目录并刷新同步状态'
+                continue
+            }
+            item.record.fileHandle = fileHandle
+            item.record.file = file
+            item.record.size = Number(file.size) || item.record.size || 0
+            item.record.lastModified = Number(file.lastModified) || item.record.lastModified || 0
+        }
+        return restored
     }
 
     function loadLocalSyncExclusions() {
@@ -2465,7 +2604,7 @@
             form.append('signature', uploadInfo.signature)
             form.append('file', file, file.name)
             GM_xmlhttpRequest({
-                method: 'POST', url: uploadInfo.host, data: form, anonymous: true, timeout: 1800000,
+                method: 'POST', url: uploadInfo.host, data: form, anonymous: true, timeout: LOCAL_SYNC_UPLOAD_TIMEOUT,
                 onprogress: event => { if (typeof onProgress === 'function') onProgress(event) },
                 onload: response => {
                     if (Number(response.status) < 200 || Number(response.status) >= 300) {
@@ -2495,9 +2634,16 @@
         return find115LocalSyncRemoteByName(items, name)
     }
 
-    async function waitFor115FileInFolder(parentCid, name, onCheck) {
+    async function waitFor115FileInFolder(parentCid, name, onCheck, options) {
+        const config = options || {}
+        const intervalMs = Number.isFinite(Number(config.intervalMs))
+            ? Math.max(0, Number(config.intervalMs))
+            : LOCAL_SYNC_CONFIRM_INTERVAL
+        const maxAttempts = Number.isFinite(Number(config.maxAttempts))
+            ? Math.max(1, Math.floor(Number(config.maxAttempts)))
+            : LOCAL_SYNC_CONFIRM_MAX_ATTEMPTS
         let attempt = 0
-        while (true) {
+        while (attempt < maxAttempts) {
             attempt += 1
             try {
                 const remote = await find115FileInFolder(parentCid, name)
@@ -2509,8 +2655,10 @@
                 if (error && error.type === 'auth' || permanentClientError) throw error
                 if (typeof onCheck === 'function') onCheck(attempt, error)
             }
-            await new Promise(resolve => setTimeout(resolve, 60000))
+            if (attempt >= maxAttempts) break
+            await new Promise(resolve => setTimeout(resolve, intervalMs))
         }
+        throw new Error('115入库核对超时：' + name + '；已检查 ' + attempt + ' 次')
     }
 
     function describe115UploadFailure(error, uploadResponse, fileName) {
@@ -2679,6 +2827,37 @@
         try { channel.postMessage({ type: 'local-sync-changed', at: Date.now() }) } catch (error) {}
     }
 
+    function ensureLocalSyncTask(state, items, targetCid) {
+        const requested = Array.isArray(items) ? items.filter(Boolean) : []
+        if (!state.syncTask) state.syncTask = createLocalSyncTask(requested, targetCid)
+        else {
+            const existingKeys = new Set((state.syncTask.items || []).map(item => item && item.key).filter(Boolean))
+            requested.forEach(item => {
+                const key = getLocalSyncRecordKey(item.record)
+                if (!key || existingKeys.has(key)) return
+                state.syncTask.items.push(serializeLocalSyncTaskItem(item))
+                existingKeys.add(key)
+            })
+            if (targetCid) state.syncTask.targetCid = String(targetCid)
+            state.syncTask.status = 'running'
+            state.syncTask.updatedAt = Date.now()
+        }
+        return state.syncTask
+    }
+
+    function snapshotLocalSyncTask(state, status) {
+        if (!state || !state.syncTask) return Promise.resolve()
+        const current = new Map((state.matches || []).map(item => [getLocalSyncRecordKey(item.record), item]))
+        state.syncTask.items = (state.syncTask.items || []).map(saved => {
+            const item = current.get(saved && saved.key)
+            return item ? serializeLocalSyncTaskItem(item) : saved
+        })
+        state.syncTask.status = status || state.syncTask.status || 'running'
+        state.syncTask.targetCid = String(state.syncTask.targetCid || '')
+        state.syncTask.updatedAt = Date.now()
+        return saveLocalSyncTask(state.syncTask)
+    }
+
     function ensure115LocalSyncStyles() {
         if (document.getElementById('missav-115-local-sync-styles')) return
         const style = document.createElement('style')
@@ -2743,6 +2922,7 @@
         const state = previousState || {
             directories: [], records: [], matches: [], scanning: false, syncing: false, remoteChanged: false,
             folderPromises: new Map(), collapsedGroups: {}, scanAndRender: null, renderCurrent: null, setStatusCurrent: null,
+            syncTask: null, taskLoading: false, taskLoadStarted: false, refreshSyncTask: null,
             statusText: '请选择要检查的本地目录', statusType: 'warn',
             hideExisting: getLocalSyncBooleanSetting(LOCAL_SYNC_HIDE_EXISTING_KEY, false),
             parentRenameSync: getLocalSyncBooleanSetting(LOCAL_SYNC_PARENT_RENAME_SYNC_KEY, false),
@@ -2750,6 +2930,9 @@
         }
         state.folderPromises = state.folderPromises || new Map()
         state.collapsedGroups = state.collapsedGroups || {}
+        state.syncTask = state.syncTask || null
+        state.taskLoading = Boolean(state.taskLoading)
+        state.taskLoadStarted = Boolean(state.taskLoadStarted)
         state.parentRenameSync = Boolean(state.parentRenameSync)
         state.excluded = state.excluded || loadLocalSyncExclusions()
         state.showExcluded = false
@@ -2939,9 +3122,15 @@
         syncAll.className = 'missav-115-local-button success'
         syncAll.type = 'button'
         syncAll.textContent = '同步全部待同步'
+        const refreshTaskButton = document.createElement('button')
+        refreshTaskButton.className = 'missav-115-local-button secondary'
+        refreshTaskButton.type = 'button'
+        refreshTaskButton.textContent = '刷新同步状态'
+        refreshTaskButton.title = '独立刷新同步任务，不重新扫描本地目录'
         syncSelected.disabled = true
         syncAll.disabled = true
-        syncRow.append(syncSelected, syncAll)
+        refreshTaskButton.disabled = false
+        syncRow.append(syncSelected, syncAll, refreshTaskButton)
         controls.appendChild(syncRow)
 
         const filterRow = document.createElement('div')
@@ -3267,25 +3456,37 @@
             const pending = getPending()
             syncSelected.disabled = state.syncing || !pending.some(item => item.selected)
             syncAll.disabled = state.syncing || pending.length === 0
+            refreshTaskButton.disabled = state.syncing || state.scanning || state.taskLoading
             rescanButton.disabled = state.scanning || state.syncing || !state.directories.length
         }
         const syncItems = async items => {
             if (state.syncing || !state.directories.length) return
-            const targetCid = String(targetInput.value || '').trim()
+            const requestedItems = (Array.isArray(items) ? items : []).filter(item => item && !isItemExcluded(item) && !item.exists && item.status !== 'synced')
+            if (!requestedItems.length) {
+                state.setStatusCurrent('没有需要同步的文件', 'ok')
+                updateButtons()
+                return
+            }
+            const targetCid = String(targetInput.value || (state.syncTask && state.syncTask.targetCid) || '').trim()
             if (targetCid && (!/^\d+$/.test(targetCid) || targetCid === '0')) { state.setStatusCurrent('目标CID可留空自动选择，或填写已有目录的非零CID；禁止使用根目录', 'error'); return }
+            targetInput.value = targetCid
             saveLocalSyncTargetCid(targetCid)
+            ensureLocalSyncTask(state, requestedItems, targetCid)
             state.syncing = true
             updateButtons()
             try {
-                for (const item of items) {
+                await snapshotLocalSyncTask(state, 'running')
+                for (const item of requestedItems) {
                     if (isItemExcluded(item) || item.exists || item.status === 'synced') continue
                     item.status = 'syncing'; item.error = ''; state.renderCurrent()
+                    await snapshotLocalSyncTask(state, 'running')
                     try {
                         const freshItems = await query115LocalSyncRemoteFiles(item.record.code)
                         const freshRemote = find115LocalSyncRemoteByRecord(freshItems, item.record)
                         const shouldReplace = Boolean(item.replaceExisting && item.record.kind === 'subtitle')
                         if (freshRemote && !shouldReplace) {
                             applyLocalSyncRemoteToSameName(state, item, freshRemote, 'exists')
+                            await snapshotLocalSyncTask(state, 'running')
                             state.renderCurrent(); continue
                         }
                         let folderPromise = state.folderPromises.get(item.record.code)
@@ -3297,6 +3498,8 @@
                             state.folderPromises.set(item.record.code, folderPromise)
                         }
                         const folderCid = await folderPromise
+                        item.folderCid = folderCid
+                        await snapshotLocalSyncTask(state, 'running')
                         const replaceRemote = shouldReplace ? await find115FileInFolder(folderCid, item.record.name) : null
                         item.remote = await uploadLocalSyncFile(item, folderCid, event => {
                             if (event && event.total) state.setStatusCurrent('正在上传 ' + item.record.name + '：' + Math.round(event.loaded / event.total * 100) + '%', 'warn')
@@ -3307,13 +3510,26 @@
                     } catch (error) {
                         item.status = 'failed'; item.error = error && error.message || String(error || '同步失败')
                     }
+                    await snapshotLocalSyncTask(state, 'running')
                     state.renderCurrent()
                 }
-                const failed = state.matches.filter(item => item.status === 'failed' || item.status === 'check-error').length
-                state.setStatusCurrent(failed
-                    ? '同步完成，但有 ' + failed + ' 个文件失败，请查看红色状态后重试'
-                    : '同步完成：已有文件已跳过，已逐个确认写入目标文件夹（网页上传记录可能不显示）', failed ? 'warn' : 'ok')
+                const taskKeys = new Set((state.syncTask && state.syncTask.items || []).map(item => item && item.key).filter(Boolean))
+                const taskItems = state.matches.filter(item => taskKeys.has(getLocalSyncRecordKey(item.record)))
+                const failed = taskItems.filter(item => item.status === 'failed' || item.status === 'check-error').length
+                const remaining = taskItems.filter(item => !(item.exists || item.status === 'exists' || item.status === 'synced') && ['pending', 'replace', 'failed', 'check-error'].includes(item.status)).length
+                if (failed || remaining) {
+                    await snapshotLocalSyncTask(state, 'paused')
+                    state.setStatusCurrent('同步暂停：有 ' + (failed || remaining) + ' 个文件未完成，可点击“刷新同步状态”继续；不会因页面刷新丢失任务', 'warn')
+                } else {
+                    await clearLocalSyncTask()
+                    state.syncTask = null
+                    state.setStatusCurrent('同步完成：已有文件已跳过，已逐个确认写入目标文件夹（网页上传记录可能不显示）', 'ok')
+                }
                 notifyLocalSyncChanged()
+            } catch (error) {
+                const message = error && error.message || String(error || '同步任务保存失败')
+                try { await snapshotLocalSyncTask(state, 'paused') } catch (saveError) {}
+                state.setStatusCurrent('同步已暂停：' + message + '；可点击“刷新同步状态”继续', 'error')
             } finally {
                 state.syncing = false
                 state.folderPromises.clear()
@@ -3368,18 +3584,80 @@
         })
         syncSelected.addEventListener('click', () => syncItems(state.matches.filter(item => item.selected && !item.exists && !isItemExcluded(item))))
         syncAll.addEventListener('click', () => syncItems(getPending()))
-        loadLocalSyncDirectoryHandles().then(handles => {
-            if (!state.directories.length) {
-                state.directories = (Array.isArray(handles) ? handles : []).map(handle => ({
-                    handle: handle,
-                    name: String(handle && handle.name || '本地目录')
-                }))
+        const refreshSyncTask = async autoResume => {
+            if (state.syncing || state.taskLoading) return
+            state.taskLoading = true
+            updateButtons()
+            state.setStatusCurrent('正在刷新同步任务…', 'warn')
+            try {
+                const [handles, task] = await Promise.all([loadLocalSyncDirectoryHandles(), loadLocalSyncTask()])
+                if (!state.directories.length) {
+                    state.directories = (Array.isArray(handles) ? handles : []).map(handle => ({
+                        handle: handle,
+                        name: String(handle && handle.name || '本地目录')
+                    }))
+                }
+                renderDirectories()
+                if (!task || !Array.isArray(task.items) || !task.items.length) {
+                    state.syncTask = null
+                    state.renderCurrent()
+                    state.setStatusCurrent(state.directories.length
+                        ? '已记住 ' + state.directories.length + ' 个目录；当前没有未完成同步任务'
+                        : '当前没有未完成同步任务，请添加本地目录并手动扫描', 'ok')
+                    return
+                }
+                state.syncTask = task
+                if (!targetInput.value && task.targetCid) targetInput.value = String(task.targetCid)
+                const restored = await hydrateLocalSyncTask(task, state.directories, !autoResume)
+                state.matches = restored
+                state.records = restored.map(item => item.record)
+                state.renderCurrent()
+                const pending = getPending().filter(item => (task.items || []).some(saved => saved && saved.key === getLocalSyncRecordKey(item.record)))
+                if (!pending.length) {
+                    state.setStatusCurrent('同步任务已刷新：没有需要同步的文件；可缩小此面板', 'ok')
+                    return
+                }
+                if (!autoResume || task.status === 'running') {
+                    state.taskLoading = false
+                    updateButtons()
+                    await syncItems(pending)
+                } else {
+                    state.setStatusCurrent('已恢复上次同步任务：有 ' + pending.length + ' 个文件待同步，点击“刷新同步状态”继续', 'warn')
+                }
+            } catch (error) {
+                state.setStatusCurrent('刷新同步任务失败：' + (error && error.message || String(error || '未知错误')), 'error')
+            } finally {
+                state.taskLoading = false
+                updateButtons()
+                state.renderCurrent()
             }
+        }
+        state.refreshSyncTask = refreshSyncTask
+        refreshTaskButton.addEventListener('click', () => refreshSyncTask(false))
+        if (!state.taskLoadStarted) {
+            state.taskLoadStarted = true
+            loadLocalSyncDirectoryHandles().then(handles => {
+                if (!state.directories.length) {
+                    state.directories = (Array.isArray(handles) ? handles : []).map(handle => ({
+                        handle: handle,
+                        name: String(handle && handle.name || '本地目录')
+                    }))
+                }
+                renderDirectories()
+                updateButtons()
+                state.renderCurrent()
+                return loadLocalSyncTask()
+            }).then(task => {
+                if (task && Array.isArray(task.items) && task.items.length) return refreshSyncTask(true)
+                if (state.directories.length && !state.syncing) state.setStatusCurrent('已记住 ' + state.directories.length + ' 个目录，请点击“手动扫描”', 'warn')
+            }).catch(error => {
+                state.setStatusCurrent('读取本地同步任务失败：' + (error && error.message || String(error || '未知错误')), 'error')
+            })
+        } else {
             renderDirectories()
             updateButtons()
             state.renderCurrent()
-            if (state.directories.length && !state.syncing) state.setStatusCurrent('已记住 ' + state.directories.length + ' 个目录，请点击“手动扫描”', 'warn')
-        }).catch(() => {})
+        }
         return card
     }
 

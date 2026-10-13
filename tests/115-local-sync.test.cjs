@@ -17,6 +17,13 @@ function getDeclaration(name) {
     return source.slice(start, next ? start + 1 + next.index : source.length)
 }
 
+function getDeclarationOrUnimplemented(name) {
+    if (source.search(new RegExp('^    (?:async )?function ' + name + '\\(', 'm')) >= 0) {
+        return getDeclaration(name)
+    }
+    return `function ${name}() { throw new Error('not implemented: ${name}') }`
+}
+
 function getConstant(name) {
     const pattern = new RegExp('^    const ' + name + ' = .*$', 'm')
     const match = source.match(pattern)
@@ -25,6 +32,7 @@ function getConstant(name) {
 }
 
 const declarations = [
+    getConstant('LOCAL_SYNC_TASK_VERSION'),
     getConstant('LOCAL_SYNC_CODE_RE'),
     getConstant('LOCAL_SYNC_NUMBER_PAIR_RE'),
     getConstant('LOCAL_SYNC_NUMBER_RE'),
@@ -40,7 +48,17 @@ const declarations = [
     getDeclaration('find115FolderByName'),
     getDeclaration('find115TopLevelCloudDownloadFolder'),
     getDeclaration('ensure115LocalSyncFolder'),
-    getDeclaration('resolve115LocalSyncFolder')
+    getDeclaration('resolve115LocalSyncFolder'),
+    getDeclaration('waitFor115FileInFolder')
+].join('\n')
+
+const taskDeclarations = [
+    getDeclaration('getLocalSyncRecordKey'),
+    getDeclaration('serializeLocalSyncTaskItem'),
+    getDeclarationOrUnimplemented('createLocalSyncTask'),
+    getDeclarationOrUnimplemented('restoreLocalSyncTask'),
+    getDeclarationOrUnimplemented('ensureLocalSyncTask'),
+    getDeclarationOrUnimplemented('snapshotLocalSyncTask')
 ].join('\n')
 
 const syncStart = source.indexOf('        const syncItems = async items => {')
@@ -48,7 +66,7 @@ const syncEnd = source.indexOf('        state.scanAndRender = async () => {', sy
 assert.ok(syncStart >= 0 && syncEnd > syncStart, 'Missing local sync action')
 const syncAction = source.slice(syncStart, syncEnd)
 
-const context = vm.createContext({ URLSearchParams })
+const context = vm.createContext({ URLSearchParams, setTimeout, clearTimeout })
 vm.runInContext(`
     const folderChildren = new Map()
     const folderCreateCalls = []
@@ -61,6 +79,9 @@ vm.runInContext(`
     }
     async function request115FolderChildren(cid) {
         return folderChildren.get(String(cid)) || []
+    }
+    async function find115FileInFolder() {
+        return null
     }
     async function request115JsonWithPageFallback(method, url, body) {
         const params = new URLSearchParams(body)
@@ -76,7 +97,10 @@ vm.runInContext(`
     function get115FolderCidFromPayload(payload) {
         return String(payload && payload.data && payload.data.cid || '')
     }
+    async function saveLocalSyncTask() {}
+    async function clearLocalSyncTask() {}
 ` + declarations + `
+` + taskDeclarations + `
     async function runSyncItems(matches, targetCid) {
         const uploads = []
         const state = {
@@ -114,6 +138,9 @@ vm.runInContext(`
         find115LocalSyncVideoFolder,
         ensure115LocalSyncFolder,
         resolve115LocalSyncFolder
+        ,createLocalSyncTask
+        ,restoreLocalSyncTask
+        ,waitFor115FileInFolder
     }
 `, context)
 
@@ -124,6 +151,51 @@ const localVideos = [
     { kind: 'subtitle', name: '030413-279 義母の筆下ろし教育 1.srt' },
     { kind: 'subtitle', name: '030413-279 義母の筆下ろし教育 2.srt' }
 ]
+
+test('persists a resumable sync task without serializing the transient File object', () => {
+    const fileHandle = { kind: 'file', name: '030413-279.srt' }
+    const item = {
+        record: {
+            file: { transient: true },
+            fileHandle,
+            name: '030413-279.srt',
+            relativePath: 'sub/030413-279.srt',
+            sourceName: '字幕目录',
+            sourceIndex: 0,
+            code: '030413-279',
+            kind: 'subtitle',
+            size: 123,
+            lastModified: 456
+        },
+        status: 'syncing',
+        selected: true,
+        replaceExisting: false,
+        exists: false,
+        error: ''
+    }
+    const task = api.createLocalSyncTask([item], '')
+    assert.equal(task.version, 1)
+    assert.equal(task.status, 'running')
+    assert.equal(task.targetCid, '')
+    assert.equal(task.items.length, 1)
+    assert.equal(task.items[0].record.file, undefined)
+    assert.equal(task.items[0].record.fileHandle, fileHandle)
+
+    const restored = api.restoreLocalSyncTask(task)
+    assert.equal(restored.length, 1)
+    assert.equal(restored[0].record.fileHandle, fileHandle)
+    assert.equal(restored[0].status, 'pending')
+    assert.equal(restored[0].selected, true)
+})
+
+test('stops polling when 115 never confirms the uploaded file', async () => {
+    let checks = 0
+    await assert.rejects(
+        api.waitFor115FileInFolder('70', 'missing.srt', () => { checks += 1 }, { intervalMs: 0, maxAttempts: 3 }),
+        /115入库核对超时.*已检查 3 次/
+    )
+    assert.equal(checks, 3)
+})
 
 test('keeps numeric hyphenated numbers intact for parsing and search', () => {
     assert.equal(api.extractLocalSyncCodeFromName(localVideos[0].name), '030413-279')
