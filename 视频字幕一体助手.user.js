@@ -2354,9 +2354,11 @@
             }
             if (!file || !fileHandle) {
                 item.status = 'failed'
+                item.localFileUnavailable = true
                 item.error = '刷新后无法读取本地文件，请重新授权目录并刷新同步状态'
                 continue
             }
+            item.localFileUnavailable = false
             item.record.fileHandle = fileHandle
             item.record.file = file
             item.record.size = Number(file.size) || item.record.size || 0
@@ -3614,15 +3616,20 @@
                 state.renderCurrent()
                 const pending = getPending().filter(item => (task.items || []).some(saved => saved && saved.key === getLocalSyncRecordKey(item.record)))
                 if (!pending.length) {
+                    await clearLocalSyncTask()
+                    state.syncTask = null
                     state.setStatusCurrent('同步任务已刷新：没有需要同步的文件；可缩小此面板', 'ok')
                     return
                 }
-                if (!autoResume || task.status === 'running') {
+                const blockedByPermission = pending.some(item => item.localFileUnavailable)
+                if (!autoResume || (!blockedByPermission && task.status === 'running')) {
                     state.taskLoading = false
                     updateButtons()
                     await syncItems(pending)
                 } else {
-                    state.setStatusCurrent('已恢复上次同步任务：有 ' + pending.length + ' 个文件待同步，点击“刷新同步状态”继续', 'warn')
+                    state.setStatusCurrent(blockedByPermission
+                        ? '已恢复上次同步任务，但本地目录权限需要确认；点击“刷新同步状态”继续'
+                        : '已恢复上次同步任务：有 ' + pending.length + ' 个文件待同步，点击“刷新同步状态”继续', 'warn')
                 }
             } catch (error) {
                 state.setStatusCurrent('刷新同步任务失败：' + (error && error.message || String(error || '未知错误')), 'error')
