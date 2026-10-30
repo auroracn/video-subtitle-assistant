@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.13.2
+// @version      2026.10.30.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -83,10 +83,13 @@
         const text = await response.text()
         return text
     }
-    // 下载分片放进 IndexedDB。刷新页面时只需重新进入当前页面，已完成的分片会继续复用。
+    // 分片保存到用户选择的本地目录，IndexedDB 只保存任务索引和目录授权。
     const VIDEO_CACHE_DB = 'missav-video-download-cache-v2'
+    const VIDEO_CACHE_DB_VERSION = 2
     const VIDEO_JOB_STORE = 'jobs'
     const VIDEO_SEGMENT_STORE = 'segments'
+    const VIDEO_SETTINGS_STORE = 'settings'
+    const VIDEO_CACHE_DIRECTORY_KEY = 'directory-handle'
     const VIDEO_DOWNLOAD_CONCURRENCY = 4
     const VIDEO_RETRY_BASE_DELAY = 1500
     const VIDEO_RETRY_MAX_DELAY = 30000
@@ -141,7 +144,7 @@
 
     function openVideoCacheDb() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open(VIDEO_CACHE_DB, 1)
+            const request = indexedDB.open(VIDEO_CACHE_DB, VIDEO_CACHE_DB_VERSION)
             request.onupgradeneeded = () => {
                 const db = request.result
                 if (!db.objectStoreNames.contains(VIDEO_JOB_STORE)) {
@@ -149,6 +152,9 @@
                 }
                 if (!db.objectStoreNames.contains(VIDEO_SEGMENT_STORE)) {
                     db.createObjectStore(VIDEO_SEGMENT_STORE, { keyPath: ['jobId', 'index'] })
+                }
+                if (!db.objectStoreNames.contains(VIDEO_SETTINGS_STORE)) {
+                    db.createObjectStore(VIDEO_SETTINGS_STORE)
                 }
             }
             request.onsuccess = () => resolve(request.result)
@@ -200,6 +206,74 @@
         return playlistUrl + '|' + filename + (segmentSignature ? '|segments:' + segmentSignature : '')
     }
 
+    function videoCacheSegmentFileName(jobId, index) {
+        let first = 2166136261
+        let second = 2654435761
+        const text = String(jobId || '')
+        for (let i = 0; i < text.length; i++) {
+            const code = text.charCodeAt(i)
+            first = Math.imul(first ^ code, 16777619)
+            second = Math.imul(second ^ (code + i + 1), 2246822519)
+        }
+        const left = (first >>> 0).toString(16).padStart(8, '0')
+        const right = (second >>> 0).toString(16).padStart(8, '0')
+        return 'missav-' + left + right + '-' + String(Number(index) || 0) + '.part'
+    }
+
+    function saveVideoCacheDirectoryHandle(handle) {
+        return runVideoCacheTransaction(VIDEO_SETTINGS_STORE, 'readwrite', store => {
+            return store.put({ handle: handle, name: String(handle && handle.name || '') }, VIDEO_CACHE_DIRECTORY_KEY)
+        })
+    }
+
+    function getVideoCacheDirectoryHandle() {
+        return runVideoCacheTransaction(VIDEO_SETTINGS_STORE, 'readonly', store => {
+            return store.get(VIDEO_CACHE_DIRECTORY_KEY)
+        }).then(value => value && value.handle ? value.handle : null)
+    }
+
+    async function hasVideoCacheDirectoryPermission(handle, requestPermission) {
+        if (!handle) return false
+        try {
+            if (typeof handle.queryPermission === 'function' &&
+                await handle.queryPermission({ mode: 'readwrite' }) === 'granted') return true
+            if (!requestPermission || typeof handle.requestPermission !== 'function') return false
+            return await handle.requestPermission({ mode: 'readwrite' }) === 'granted'
+        } catch (error) {
+            return false
+        }
+    }
+
+    async function chooseVideoCacheDirectory(controls) {
+        if (typeof window.showDirectoryPicker !== 'function') {
+            throw new Error('当前浏览器不支持选择本地缓存目录，请使用支持 File System Access API 的 Chrome 或 115 浏览器')
+        }
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite' })
+        if (!handle) throw new Error('没有选择缓存目录')
+        if (!await hasVideoCacheDirectoryPermission(handle, true)) {
+            throw new Error('没有获得缓存目录的读写权限')
+        }
+        await saveVideoCacheDirectoryHandle(handle)
+        if (controls && controls.cacheDirectoryHint) {
+            controls.cacheDirectoryHint.textContent = '缓存目录：' + (handle.name || '已选择目录')
+        }
+        return handle
+    }
+
+    async function resolveVideoCacheDirectory(job, requestPermission, controls) {
+        let handle = job && job.cacheDirectoryHandle
+        if (!handle) handle = await getVideoCacheDirectoryHandle()
+        if (!handle) {
+            if (!requestPermission) return null
+            return chooseVideoCacheDirectory(controls)
+        }
+        if (!await hasVideoCacheDirectoryPermission(handle, requestPermission)) {
+            if (!requestPermission) return null
+            throw new Error('缓存目录授权已失效，请重新设置缓存目录')
+        }
+        return handle
+    }
+
     function saveVideoJob(job) {
         return runVideoCacheTransaction(VIDEO_JOB_STORE, 'readwrite', store => store.put(job))
     }
@@ -208,9 +282,27 @@
         return runVideoCacheTransaction(VIDEO_JOB_STORE, 'readonly', store => store.get(jobId))
     }
 
-    function saveVideoSegment(jobId, index, blob) {
+    async function saveVideoSegment(job, index, blob) {
+        const directory = job && job.cacheDirectoryHandle
+        if (!directory) throw new Error('没有设置视频缓存目录')
+        const fileName = videoCacheSegmentFileName(job.id, index)
+        const fileHandle = await directory.getFileHandle(fileName, { create: true })
+        const writable = await fileHandle.createWritable()
+        try {
+            await writable.write(blob)
+            await writable.close()
+        } catch (error) {
+            try { await writable.abort() } catch (abortError) {}
+            throw error
+        }
         return runVideoCacheTransaction(VIDEO_SEGMENT_STORE, 'readwrite', store => {
-            return store.put({ jobId: jobId, index: index, blob: blob })
+            return store.put({
+                jobId: job.id,
+                index: index,
+                fileName: fileName,
+                size: Number(blob && blob.size) || 0,
+                storage: 'filesystem'
+            })
         })
     }
 
@@ -288,10 +380,21 @@
         throw new Error('下载已取消')
     }
 
-    function getVideoSegment(jobId, index) {
+    function getVideoSegmentRecord(jobId, index) {
         return runVideoCacheTransaction(VIDEO_SEGMENT_STORE, 'readonly', store => {
             return store.get([jobId, index])
-        }).then(item => item && item.blob)
+        })
+    }
+
+    async function getVideoSegment(jobId, index) {
+        const item = await getVideoSegmentRecord(jobId, index)
+        if (!item) return null
+        if (!item.fileName) return item.blob || null
+        const job = await getVideoJob(jobId)
+        const directory = job && job.cacheDirectoryHandle
+        if (!directory) throw new Error('缓存目录授权已失效，无法读取第 ' + (Number(index) + 1) + ' 个分片')
+        const fileHandle = await directory.getFileHandle(item.fileName, { create: false })
+        return fileHandle.getFile()
     }
 
     function getVideoSegmentIndexes(jobId) {
@@ -301,7 +404,56 @@
         }).then(keys => (keys || []).map(key => key[1]))
     }
 
-    function clearVideoJob(jobId) {
+    function getVideoSegmentRecords(jobId) {
+        const range = IDBKeyRange.bound([jobId, 0], [jobId, Number.MAX_SAFE_INTEGER])
+        return runVideoCacheTransaction(VIDEO_SEGMENT_STORE, 'readonly', store => store.getAll(range))
+    }
+
+    async function migrateVideoCacheToDirectory(job, directory, controls, runtime) {
+        const records = await getVideoSegmentRecords(job.id)
+        const legacyRecords = records.filter(record => record && record.blob)
+        for (let i = 0; i < legacyRecords.length; i++) {
+            if (runtime && isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+            const record = legacyRecords[i]
+            const migrationJob = { id: job.id, cacheDirectoryHandle: directory }
+            await saveVideoSegment(migrationJob, record.index, record.blob)
+            if (controls && controls.progress) {
+                controls.progress.textContent = '正在迁移旧缓存 ' + (i + 1) + '/' + legacyRecords.length + ' 个分片'
+            }
+        }
+    }
+
+    async function prepareVideoCacheJob(job, controls, requestPermission, runtime) {
+        const directory = await resolveVideoCacheDirectory(job, requestPermission, controls)
+        if (!directory) return null
+        const records = await getVideoSegmentRecords(job.id)
+        const needsMigration = records.some(record => record && record.blob)
+        job.cacheDirectoryHandle = directory
+        job.cacheDirectoryName = String(directory.name || '')
+        job.cacheStorage = 'filesystem'
+        if (needsMigration) await saveVideoJob(job)
+        if (needsMigration) await migrateVideoCacheToDirectory(job, directory, controls, runtime)
+        return directory
+    }
+
+    async function removeVideoCacheFiles(job, records) {
+        const directory = job && job.cacheDirectoryHandle
+        if (!directory) return
+        for (const record of records || []) {
+            if (!record || !record.fileName) continue
+            try {
+                await directory.removeEntry(record.fileName)
+            } catch (error) {
+                if (error && error.name === 'NotFoundError') continue
+                throw error
+            }
+        }
+    }
+
+    async function clearVideoJob(jobId) {
+        const job = await getVideoJob(jobId)
+        const records = await getVideoSegmentRecords(jobId)
+        await removeVideoCacheFiles(job, records)
         const range = IDBKeyRange.bound([jobId, 0], [jobId, Number.MAX_SAFE_INTEGER])
         return runVideoCacheTransaction([VIDEO_JOB_STORE, VIDEO_SEGMENT_STORE], 'readwrite', (jobs, segments) => {
             jobs.delete(jobId)
@@ -327,7 +479,7 @@
                 const cursor = segmentsRequest.result
                 if (!cursor) return
                 const record = cursor.value || {}
-                const size = record.blob && Number(record.blob.size) || 0
+                const size = Number(record.size) || (record.blob && Number(record.blob.size)) || 0
                 overview.bytes += size
                 overview.segments += 1
                 overview.bytesByJob.set(record.jobId, (overview.bytesByJob.get(record.jobId) || 0) + size)
@@ -915,7 +1067,7 @@
                 : '已完成（MP4），缓存仍保留；不需要时点击“清除缓存”'
     }
 
-    async function startOrResumeVideoDownload(fileInfo, controls) {
+    async function startOrResumeVideoDownload(fileInfo, controls, requestDirectoryPermission) {
         const jobId = fileInfo.jobId
         if (activeVideoDownloads.has(jobId)) return
         const runtime = { controller: new AbortController(), clearing: false, manualPause: false, resolveDone: null }
@@ -945,6 +1097,9 @@
                 job.segmentSignature = fileInfo.segmentSignature
             }
 
+            const cacheDirectory = await prepareVideoCacheJob(job, controls, requestDirectoryPermission !== false, runtime)
+            if (!cacheDirectory) throw new Error('请先设置视频缓存目录，再继续下载')
+            await saveVideoJob(job)
             const cachedIndexes = new Set(await getVideoSegmentIndexes(jobId))
             if (job.status === 'completed' && cachedIndexes.size === job.total) {
                 await exportCachedVideo(job, controls, runtime)
@@ -960,7 +1115,7 @@
             updateVideoControls(controls, '暂停下载', 'lightgreen', false)
             controls.progress.textContent = '已缓存 ' + job.completed + '/' + job.total + ' 个分片'
 
-            // 分片并发下载；每个分片完成后仍立即写入 IndexedDB，确保刷新后可以续传。
+            // 分片并发下载；每个分片写入用户目录后再保存索引，确保刷新后可以续传。
             let nextIndex = 0
             let workerError = null
             const downloadWorker = async () => {
@@ -973,7 +1128,7 @@
 
                         const segment = job.segments[i]
                         const blob = await fetchVideoSegmentWithRetry(segment, runtime, controls)
-                        await saveVideoSegment(jobId, i, blob)
+                        await saveVideoSegment(job, i, blob)
                         cachedIndexes.add(i)
                         job.completed = cachedIndexes.size
                         job.updatedAt = Date.now()
@@ -1059,9 +1214,15 @@
                 controls.progress.textContent = '已有完整缓存，点击“重新导出”即可生成文件'
                 return
             }
+            const cacheDirectory = await resolveVideoCacheDirectory(job, false)
+            if (!cacheDirectory) {
+                updateVideoControls(controls, '恢复下载', 'lightyellow', false)
+                controls.progress.textContent = '检测到已有缓存，请先设置缓存目录后点击“恢复下载”'
+                return
+            }
             updateVideoControls(controls, '恢复下载', 'lightyellow', false)
             controls.progress.textContent = '检测到上次下载：已缓存 ' + cachedCount + '/' + fileInfo.segments.length + ' 个分片，正在继续'
-            startOrResumeVideoDownload(fileInfo, controls)
+            startOrResumeVideoDownload(fileInfo, controls, false)
         } catch (error) {
             console.warn('[MissAV 下载] 读取下载缓存失败：', error)
         }
@@ -1085,6 +1246,19 @@
             controls.progress.textContent = '清除缓存失败：' + (error.message || error)
         }
     }
+
+    async function refreshVideoCacheDirectoryLabel(controls) {
+        if (!controls || !controls.cacheDirectoryHint) return
+        try {
+            const handle = await getVideoCacheDirectoryHandle()
+            controls.cacheDirectoryHint.textContent = handle
+                ? '缓存目录：' + (handle.name || '已选择目录')
+                : '缓存目录：未设置（首次下载时选择）'
+        } catch (error) {
+            controls.cacheDirectoryHint.textContent = '缓存目录：尚未读取'
+        }
+    }
+
     function ensureVideoDownloadStyles() {
         if (document.getElementById('missav-video-download-styles')) return
         const style = document.createElement('style')
@@ -1115,6 +1289,7 @@
             '.missav-video-history-open:hover,.missav-video-history-more:hover{filter:brightness(1.12);}',
             '.missav-video-history-more{display:block;margin:8px auto 0;background:#1d4ed8;color:#dbeafe;}',
             '.missav-video-history-actions{margin-top:8px;}',
+            '.missav-video-cache-directory{display:block;margin-top:8px;color:#8fa6b8;font-size:11px;line-height:1.4;}',
             '@media (max-width:560px){.missav-video-download-actions{display:grid;grid-template-columns:1fr 1fr;}.missav-video-download-action{width:100%;}.missav-video-download-115{grid-column:1 / -1;}}'
         ].join('\n')
         document.head.appendChild(style)
@@ -1199,6 +1374,11 @@
         historyMore.style.display = 'none'
         historySection.appendChild(historyMore)
 
+        const cacheDirectoryHint = document.createElement('div')
+        cacheDirectoryHint.className = 'missav-video-cache-directory'
+        cacheDirectoryHint.textContent = '缓存目录：未设置（首次下载时选择）'
+        historySection.appendChild(cacheDirectoryHint)
+
         const historyActions = document.createElement('div')
         historyActions.className = 'missav-video-download-actions missav-video-history-actions'
         historyActions.appendChild(clearButton)
@@ -1209,6 +1389,12 @@
         downloadsButton.textContent = '打开下载列表'
         downloadsButton.title = '打开浏览器下载列表，再选择“在文件夹中显示”'
         historyActions.appendChild(downloadsButton)
+        const cacheDirectoryButton = document.createElement('button')
+        cacheDirectoryButton.className = 'missav-video-download-action missav-video-download-cache'
+        cacheDirectoryButton.type = 'button'
+        cacheDirectoryButton.textContent = '设置缓存目录'
+        cacheDirectoryButton.title = '选择视频分片缓存保存位置'
+        historyActions.appendChild(cacheDirectoryButton)
         historySection.appendChild(historyActions)
         card.appendChild(historySection)
 
@@ -1216,6 +1402,8 @@
             downloadButton: downloadButton,
             clearButton: clearButton,
             cacheButton: cacheButton,
+            cacheDirectoryButton: cacheDirectoryButton,
+            cacheDirectoryHint: cacheDirectoryHint,
             cacheHint: hint,
             progress: progress,
             historyLimit: VIDEO_HISTORY_PAGE_SIZE,
@@ -1236,6 +1424,15 @@
         clearButton.addEventListener('click', () => clearVideoDownload(fileInfo, controls))
         cacheButton.addEventListener('click', () => clearOtherVideoCache(fileInfo.jobId, fileInfo, controls))
         downloadsButton.addEventListener('click', openBrowserDownloads)
+        cacheDirectoryButton.addEventListener('click', async () => {
+            try {
+                await chooseVideoCacheDirectory(controls)
+                controls.progress.textContent = '缓存目录已设置，后续视频分片将保存到该目录'
+            } catch (error) {
+                if (error && error.name === 'AbortError') return
+                controls.progress.textContent = '设置缓存目录失败：' + (error.message || error)
+            }
+        })
         historyMore.addEventListener('click', () => {
             controls.historyLimit += VIDEO_HISTORY_PAGE_SIZE
             refreshVideoCacheSummary(fileInfo, controls)
@@ -1243,6 +1440,7 @@
         to115Button.addEventListener('click', () => submitTo115(fileInfo.url, to115Button))
         restoreVideoDownload(fileInfo, controls)
         refreshVideoCacheSummary(fileInfo, controls)
+        refreshVideoCacheDirectoryLabel(controls)
         return card
     }
 
@@ -5776,7 +5974,11 @@
             const downloadUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = downloadUrl;
-            a.download = (name || 'subtitle').replace(/[<>:"/\\|?*]/g, '_') + '.srt';
+            const baseName = String(name || 'subtitle')
+                .replace(/[<>:"/\\|?*]/g, '_')
+                .replace(/(?:\.(?:srt|vtt|ass|ssa|sup))+$/i, '')
+                .trim() || 'subtitle';
+            a.download = baseName + '.srt';
             a.click();
             URL.revokeObjectURL(downloadUrl);
             showToast('字幕下载成功');
