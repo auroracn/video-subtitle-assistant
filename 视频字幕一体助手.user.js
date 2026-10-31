@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.30.1
+// @version      2026.10.31.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -3235,6 +3235,7 @@
             '.missav-115-local-filter input{margin:0;accent-color:#22c55e;}',
             '.missav-115-local-excluded{display:none;margin-top:7px;padding:6px;border:1px solid rgba(248,113,113,.28);border-radius:6px;background:rgba(69,10,10,.25);}',
             '.missav-115-local-excluded.open{display:grid;gap:4px;}',
+            '.missav-115-local-excluded-head{display:flex;align-items:center;justify-content:space-between;gap:5px;color:#fecaca;font-size:10px;font-weight:700;}',
             '.missav-115-local-excluded-row{display:flex;align-items:center;gap:5px;color:#fecaca;font-size:10px;}',
             '.missav-115-local-excluded-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
             '.missav-115-local-empty{padding:10px 4px;color:#94a3b8;text-align:center;font-size:11px;}',
@@ -3635,6 +3636,38 @@
             excludedHistory.classList.toggle('open', Boolean(state.showExcluded))
             excludedHistory.replaceChildren()
             if (!state.showExcluded) return
+            const historyHead = document.createElement('div')
+            historyHead.className = 'missav-115-local-excluded-head'
+            const historyTitle = document.createElement('span')
+            historyTitle.textContent = '已排除的上传内容'
+            historyHead.appendChild(historyTitle)
+            if (entries.length) {
+                const entryKeys = new Set(entries.map(entry => entry.key))
+                const restoreAll = document.createElement('button')
+                restoreAll.className = 'missav-115-local-dir-action'
+                restoreAll.type = 'button'
+                restoreAll.textContent = '恢复全部'
+                restoreAll.addEventListener('click', async () => {
+                    const restoredCount = entries.length
+                    entries.forEach(entry => { delete state.excluded[entry.key] })
+                    state.matches.forEach(item => {
+                        if (entryKeys.has(getLocalSyncRecordKey(item.record))) {
+                            item.excluded = false
+                            item.selected = true
+                        }
+                    })
+                    saveLocalSyncExclusions(state.excluded)
+                    render()
+                    if (state.directories.length && !state.scanning && !state.syncing) {
+                        setStatus('已恢复 ' + restoredCount + ' 条，正在重新扫描并显示…', 'warn')
+                        await state.scanAndRender()
+                    } else {
+                        setStatus('已恢复 ' + restoredCount + ' 条；请点击“手动扫描”重新显示内容', 'ok')
+                    }
+                })
+                historyHead.appendChild(restoreAll)
+            }
+            excludedHistory.appendChild(historyHead)
             if (!entries.length) {
                 const empty = document.createElement('div')
                 empty.className = 'missav-115-local-empty'
@@ -3654,14 +3687,22 @@
                 restore.className = 'missav-115-local-dir-action'
                 restore.type = 'button'
                 restore.textContent = '恢复'
-                restore.addEventListener('click', () => {
+                restore.addEventListener('click', async () => {
                     delete state.excluded[entry.key]
                     state.matches.forEach(item => {
-                        if (getLocalSyncRecordKey(item.record) === entry.key) item.excluded = false
+                        if (getLocalSyncRecordKey(item.record) === entry.key) {
+                            item.excluded = false
+                            item.selected = true
+                        }
                     })
                     saveLocalSyncExclusions(state.excluded)
                     render()
-                    setStatus('已恢复：' + (entry.name || '该文件') + '，现在可以同步', 'ok')
+                    if (state.directories.length && !state.scanning && !state.syncing) {
+                        setStatus('已恢复：' + (entry.name || '该文件') + '，正在重新扫描…', 'warn')
+                        await state.scanAndRender()
+                    } else {
+                        setStatus('已恢复：' + (entry.name || '该文件') + '；请点击“手动扫描”重新显示', 'ok')
+                    }
                 })
                 row.appendChild(restore)
                 excludedHistory.appendChild(row)
