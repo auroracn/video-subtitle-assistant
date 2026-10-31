@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.31.2
+// @version      2026.10.31.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -3799,6 +3799,7 @@
             if (!state.showExcluded) return
             const historyHead = document.createElement('div')
             historyHead.className = 'missav-115-local-excluded-head'
+            historyHead.style.cssText = 'display:flex!important;align-items:center;justify-content:space-between;gap:5px;'
             const historyTitle = document.createElement('span')
             historyTitle.textContent = '已排除的上传内容'
             historyHead.appendChild(historyTitle)
@@ -3807,6 +3808,7 @@
                 restoreAll.className = 'missav-115-local-dir-action'
                 restoreAll.type = 'button'
                 restoreAll.textContent = '恢复全部'
+                restoreAll.style.cssText = 'display:inline-block!important;visibility:visible!important;flex:0 0 auto!important;white-space:nowrap!important;padding:3px 7px!important;background:#475569!important;color:#e2e8f0!important;border:0!important;border-radius:3px!important;font-size:10px!important;cursor:pointer!important;'
                 restoreAll.addEventListener('click', () => restoreExcludedEntries(entries))
                 historyHead.appendChild(restoreAll)
             }
@@ -3821,6 +3823,7 @@
             entries.forEach(entry => {
                 const row = document.createElement('div')
                 row.className = 'missav-115-local-excluded-row'
+                row.style.cssText = 'display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;align-items:center;gap:5px;'
                 const name = document.createElement('span')
                 name.className = 'missav-115-local-excluded-name'
                 name.textContent = (entry.code ? entry.code + ' · ' : '') + (entry.name || entry.relativePath || '未命名文件')
@@ -3830,6 +3833,8 @@
                 restore.className = 'missav-115-local-dir-action'
                 restore.type = 'button'
                 restore.textContent = '恢复'
+                restore.setAttribute('aria-label', '恢复 ' + (entry.name || '该文件'))
+                restore.style.cssText = 'display:inline-block!important;visibility:visible!important;position:static!important;flex:0 0 auto!important;white-space:nowrap!important;width:auto!important;min-width:34px!important;padding:3px 7px!important;background:#16a34a!important;color:#f0fdf4!important;border:0!important;border-radius:3px!important;font-size:10px!important;line-height:1.2!important;cursor:pointer!important;'
                 restore.addEventListener('click', () => restoreExcludedEntries([entry]))
                 row.appendChild(restore)
                 excludedHistory.appendChild(row)
