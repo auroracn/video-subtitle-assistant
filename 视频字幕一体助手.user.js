@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.31.1
+// @version      2026.10.31.2
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -357,27 +357,99 @@
         })
     }
 
-    async function fetchVideoSegmentWithRetry(segment, runtime, controls) {
+    function getVideoConnectionHost(url) {
+        try { return new URL(url, location.href).host || '未知主机' } catch (error) { return '未知主机' }
+    }
+
+    function updateVideoConnectionMonitor(controls, runtime) {
+        if (!controls || !controls.connectionSummary || !controls.connectionDetails) return
+        const monitor = runtime && runtime.connectionMonitor
+        if (!monitor) {
+            controls.connectionSummary.textContent = '连接监控：下载开始后显示'
+            controls.connectionDetails.textContent = '点击下载后，这里会显示并发连接、当前分片、重试次数和失败连接。'
+            return
+        }
+        const active = Array.from(monitor.active.values())
+        const phase = monitor.phase || (active.length ? '下载中' : '等待连接')
+        controls.connectionSummary.textContent = phase + ' · 连接 ' + active.length + '/' + VIDEO_DOWNLOAD_CONCURRENCY +
+            ' · 已完成 ' + monitor.completed + '/' + monitor.total +
+            ' · 重试 ' + monitor.retries + ' · 失败 ' + monitor.failures.length
+        const lines = active.map(item => '连接' + item.workerId + '：分片 ' + (item.index + 1) +
+            ' · ' + item.state + ' · ' + item.host + (item.attempt > 0 ? ' · 第' + item.attempt + '次' : ''))
+        if (monitor.lastError) lines.push('最近错误：' + monitor.lastError)
+        if (monitor.failures.length) {
+            const lastFailure = monitor.failures[monitor.failures.length - 1]
+            lines.push('最近失败：分片 ' + (lastFailure.index + 1) + ' · ' + lastFailure.message)
+        }
+        controls.connectionDetails.textContent = lines.length
+            ? lines.join('\n')
+            : (monitor.phase === '已完成' ? '所有分片连接已完成。' : '当前没有活动连接。')
+    }
+
+    async function fetchVideoSegmentWithRetry(segment, runtime, controls, workerId) {
         let attempt = 0
-        while (!runtime.clearing) {
-            try {
-                return await fetchVideoSegment(segment, runtime.controller.signal)
-            } catch (error) {
-                if (runtime.clearing || runtime.controller.signal.aborted) throw error
-                attempt++
-                const retryable = error.retryable !== false
-                if (!retryable && attempt >= VIDEO_NON_RETRYABLE_MAX_ATTEMPTS) throw error
-                const delay = Math.min(
-                    VIDEO_RETRY_MAX_DELAY,
-                    VIDEO_RETRY_BASE_DELAY * Math.pow(2, Math.min(attempt - 1, 5))
-                )
-                const segmentNumber = (segment.index || 0) + 1
-                controls.progress.textContent = '第 ' + segmentNumber + ' 个分片网络波动，' +
-                    Math.ceil(delay / 1000) + ' 秒后自动重试（第 ' + attempt + ' 次）'
-                await waitVideoRetry(delay, runtime.controller.signal)
+        const monitor = runtime.connectionMonitor
+        const connectionId = String(workerId || 1)
+        if (monitor) {
+            monitor.active.set(connectionId, {
+                workerId: connectionId,
+                index: Number(segment.index) || 0,
+                host: getVideoConnectionHost(segment.url),
+                state: '请求中',
+                attempt: 0
+            })
+            updateVideoConnectionMonitor(controls, runtime)
+        }
+        try {
+            while (!runtime.clearing) {
+                try {
+                    const result = await fetchVideoSegment(segment, runtime.controller.signal)
+                    if (monitor) {
+                        monitor.completed += 1
+                        const connection = monitor.active.get(connectionId)
+                        if (connection) connection.state = '已完成'
+                    }
+                    return result
+                } catch (error) {
+                    if (runtime.clearing || runtime.controller.signal.aborted) throw error
+                    attempt++
+                    const retryable = error.retryable !== false
+                    const delay = Math.min(
+                        VIDEO_RETRY_MAX_DELAY,
+                        VIDEO_RETRY_BASE_DELAY * Math.pow(2, Math.min(attempt - 1, 5))
+                    )
+                    if (monitor) {
+                        const connection = monitor.active.get(connectionId)
+                        if (connection) {
+                            connection.state = '等待重试'
+                            connection.attempt = attempt
+                        }
+                        monitor.retries += 1
+                        monitor.lastError = '分片 ' + ((segment.index || 0) + 1) + '：' + (error.message || error)
+                        updateVideoConnectionMonitor(controls, runtime)
+                    }
+                    const segmentNumber = (segment.index || 0) + 1
+                    controls.progress.textContent = '第 ' + segmentNumber + ' 个分片网络波动，' +
+                        Math.ceil(delay / 1000) + ' 秒后自动重试（第 ' + attempt + ' 次）'
+                    if (!retryable && attempt >= VIDEO_NON_RETRYABLE_MAX_ATTEMPTS) {
+                        if (monitor) monitor.failures.push({ index: Number(segment.index) || 0, message: error.message || String(error) })
+                        throw error
+                    }
+                    await waitVideoRetry(delay, runtime.controller.signal)
+                    if (monitor) {
+                        const connection = monitor.active.get(connectionId)
+                        if (connection) connection.state = '请求中'
+                        updateVideoConnectionMonitor(controls, runtime)
+                    }
+                }
+            }
+            throw new Error('下载已取消')
+        } finally {
+            if (monitor) {
+                monitor.active.delete(connectionId)
+                updateVideoConnectionMonitor(controls, runtime)
             }
         }
-        throw new Error('下载已取消')
     }
 
     function getVideoSegmentRecord(jobId, index) {
@@ -1101,11 +1173,24 @@
             if (!cacheDirectory) throw new Error('请先设置视频缓存目录，再继续下载')
             await saveVideoJob(job)
             const cachedIndexes = new Set(await getVideoSegmentIndexes(jobId))
+            runtime.connectionMonitor = {
+                active: new Map(),
+                completed: cachedIndexes.size,
+                total: job.total,
+                retries: 0,
+                failures: [],
+                lastError: '',
+                phase: '准备下载'
+            }
+            updateVideoConnectionMonitor(controls, runtime)
             if (job.status === 'completed' && cachedIndexes.size === job.total) {
+                runtime.connectionMonitor.phase = '已完成'
+                updateVideoConnectionMonitor(controls, runtime)
                 await exportCachedVideo(job, controls, runtime)
                 return
             }
 
+            runtime.connectionMonitor.phase = '下载中'
             job.status = 'downloading'
             job.completed = cachedIndexes.size
             job.updatedAt = Date.now()
@@ -1118,7 +1203,7 @@
             // 分片并发下载；每个分片写入用户目录后再保存索引，确保刷新后可以续传。
             let nextIndex = 0
             let workerError = null
-            const downloadWorker = async () => {
+            const downloadWorker = async workerId => {
                 try {
                     while (true) {
                         if (runtime.clearing) throw new Error('下载已取消')
@@ -1127,7 +1212,7 @@
                         if (cachedIndexes.has(i)) continue
 
                         const segment = job.segments[i]
-                        const blob = await fetchVideoSegmentWithRetry(segment, runtime, controls)
+                        const blob = await fetchVideoSegmentWithRetry(segment, runtime, controls, workerId)
                         await saveVideoSegment(job, i, blob)
                         cachedIndexes.add(i)
                         job.completed = cachedIndexes.size
@@ -1148,7 +1233,7 @@
                 Math.max(1, job.segments.length - cachedIndexes.size)
             )
             try {
-                await Promise.all(Array.from({ length: workerCount }, () => downloadWorker()))
+                await Promise.all(Array.from({ length: workerCount }, (_, index) => downloadWorker(index + 1)))
             } catch (error) {
                 throw workerError || error
             }
@@ -1157,11 +1242,17 @@
             job.completed = job.total
             job.updatedAt = Date.now()
             await saveVideoJob(job)
+            runtime.connectionMonitor.phase = '已完成'
+            updateVideoConnectionMonitor(controls, runtime)
             notifyVideoCacheChanged('completed', jobId)
             await refreshVideoCacheSummary(fileInfo, controls)
             await exportCachedVideo(job, controls, runtime)
         } catch (error) {
             if (!runtime.clearing) {
+                if (runtime.connectionMonitor) {
+                    runtime.connectionMonitor.phase = runtime.manualPause ? '已暂停' : '已停止'
+                    updateVideoConnectionMonitor(controls, runtime)
+                }
                 const job = await getVideoJob(jobId).catch(() => null)
                 if (runtime.manualPause) {
                     if (job && job.status !== 'completed') {
@@ -1270,6 +1361,10 @@
             '.missav-video-quality-badge{padding:4px 8px;border-radius:6px;background:#164e3b;color:#bbf7d0;}',
             '.missav-video-download-hint{color:#9fb4c8;font-size:11px;}',
             '.missav-video-download-status{display:block;min-height:18px;margin:9px 0;color:#b8d7e5;font-size:12px;line-height:1.5;}',
+            '.missav-video-connection-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 0 8px;color:#9fb4c8;font-size:11px;}',
+            '.missav-video-connection-summary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+            '.missav-video-connection-toggle{min-height:25px;padding:0 8px;border:0;border-radius:5px;background:#475569;color:#e2e8f0;font-size:11px;cursor:pointer;white-space:nowrap;}',
+            '.missav-video-connection-details{margin:0 0 8px;padding:6px 8px;border:1px solid rgba(148,163,184,.22);border-radius:5px;background:rgba(15,23,42,.6);color:#a5f3fc;font:10px/1.45 Consolas,monospace;white-space:pre-wrap;word-break:break-word;}',
             '.missav-video-download-actions{display:flex;flex-wrap:wrap;gap:7px;}',
             '.missav-video-download-action{min-height:31px;padding:0 12px;border:0;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;transition:filter .15s,transform .15s;}',
             '.missav-video-download-action:hover{filter:brightness(1.08);transform:translateY(-1px);}',
@@ -1323,6 +1418,23 @@
         progress.className = 'missav-video-download-status'
         progress.textContent = '准备下载'
         card.appendChild(progress)
+
+        const connectionRow = document.createElement('div')
+        connectionRow.className = 'missav-video-connection-row'
+        const connectionSummary = document.createElement('span')
+        connectionSummary.className = 'missav-video-connection-summary'
+        connectionSummary.textContent = '连接监控：下载开始后显示'
+        const connectionToggle = document.createElement('button')
+        connectionToggle.className = 'missav-video-connection-toggle'
+        connectionToggle.type = 'button'
+        connectionToggle.textContent = '连接详情'
+        connectionRow.append(connectionSummary, connectionToggle)
+        card.appendChild(connectionRow)
+        const connectionDetails = document.createElement('pre')
+        connectionDetails.className = 'missav-video-connection-details'
+        connectionDetails.hidden = true
+        connectionDetails.textContent = '点击下载后，这里会显示并发连接、当前分片、重试次数和失败连接。'
+        card.appendChild(connectionDetails)
 
         const actions = document.createElement('div')
         actions.className = 'missav-video-download-actions'
@@ -1406,6 +1518,8 @@
             cacheDirectoryHint: cacheDirectoryHint,
             cacheHint: hint,
             progress: progress,
+            connectionSummary: connectionSummary,
+            connectionDetails: connectionDetails,
             historyLimit: VIDEO_HISTORY_PAGE_SIZE,
             history: {
                 empty: historyEmpty,
@@ -1424,6 +1538,10 @@
         clearButton.addEventListener('click', () => clearVideoDownload(fileInfo, controls))
         cacheButton.addEventListener('click', () => clearOtherVideoCache(fileInfo.jobId, fileInfo, controls))
         downloadsButton.addEventListener('click', openBrowserDownloads)
+        connectionToggle.addEventListener('click', () => {
+            connectionDetails.hidden = !connectionDetails.hidden
+            connectionToggle.textContent = connectionDetails.hidden ? '连接详情' : '收起详情'
+        })
         cacheDirectoryButton.addEventListener('click', async () => {
             try {
                 await chooseVideoCacheDirectory(controls)
@@ -3630,6 +3748,49 @@
         const isItemExcluded = item => Boolean(item && (item.excluded || state.excluded[getLocalSyncRecordKey(item.record)]))
         const isExistingItem = item => Boolean(item && (item.exists || item.status === 'exists' || item.status === 'synced'))
         const getPending = () => state.matches.filter(item => !isItemExcluded(item) && !item.exists && ['pending', 'replace', 'failed', 'check-error'].includes(item.status))
+        const matchesExcludedEntry = (record, entry) => {
+            if (!record || !entry) return false
+            if (entry.key && getLocalSyncRecordKey(record) === String(entry.key)) return true
+            return get115FileNameKey(record.sourceName || '') === get115FileNameKey(entry.sourceName || '') &&
+                get115FileNameKey(record.relativePath || record.name || '') === get115FileNameKey(entry.relativePath || entry.name || '') &&
+                get115FileNameKey(record.name || '') === get115FileNameKey(entry.name || '')
+        }
+        const restoreExcludedEntries = async entriesToRestore => {
+            const entries = (Array.isArray(entriesToRestore) ? entriesToRestore : []).filter(entry => entry && entry.key)
+            if (!entries.length) return
+            const entryList = entries.map(entry => ({ ...entry }))
+            entryList.forEach(entry => { delete state.excluded[entry.key] })
+            state.matches.forEach(item => {
+                if (entryList.some(entry => matchesExcludedEntry(item.record, entry))) {
+                    item.excluded = false
+                    item.selected = true
+                }
+            })
+            saveLocalSyncExclusions(state.excluded)
+            render()
+            const currentMatches = state.matches.filter(item => entryList.some(entry => matchesExcludedEntry(item.record, entry)))
+            if (currentMatches.length) {
+                const hiddenByExistingFilter = state.hideExisting && currentMatches.some(isExistingItem)
+                setStatus('已恢复 ' + entryList.length + ' 条' +
+                    (hiddenByExistingFilter ? '；其中已有115文件的内容受“只显示待同步文件”筛选影响' : '，现在可以同步'),
+                    hiddenByExistingFilter ? 'warn' : 'ok')
+                return
+            }
+            if (state.scanning) {
+                setStatus('已恢复 ' + entryList.length + ' 条，当前扫描完成后会显示', 'warn')
+                return
+            }
+            if (state.syncing) {
+                setStatus('已恢复 ' + entryList.length + ' 条，请在当前同步完成后点击“手动扫描”', 'warn')
+                return
+            }
+            if (state.directories.length) {
+                setStatus('已恢复 ' + entryList.length + ' 条，正在重新扫描…', 'warn')
+                await state.scanAndRender()
+                return
+            }
+            setStatus('已恢复 ' + entryList.length + ' 条；添加本地目录后点击“手动扫描”即可显示', 'ok')
+        }
         const renderExcludedHistory = () => {
             const entries = Object.values(state.excluded || {}).sort((a, b) => Number(b.excludedAt || 0) - Number(a.excludedAt || 0))
             excludedToggle.textContent = entries.length ? '排除历史（' + entries.length + '）' : '排除历史'
@@ -3642,29 +3803,11 @@
             historyTitle.textContent = '已排除的上传内容'
             historyHead.appendChild(historyTitle)
             if (entries.length) {
-                const entryKeys = new Set(entries.map(entry => entry.key))
                 const restoreAll = document.createElement('button')
                 restoreAll.className = 'missav-115-local-dir-action'
                 restoreAll.type = 'button'
                 restoreAll.textContent = '恢复全部'
-                restoreAll.addEventListener('click', async () => {
-                    const restoredCount = entries.length
-                    entries.forEach(entry => { delete state.excluded[entry.key] })
-                    state.matches.forEach(item => {
-                        if (entryKeys.has(getLocalSyncRecordKey(item.record))) {
-                            item.excluded = false
-                            item.selected = true
-                        }
-                    })
-                    saveLocalSyncExclusions(state.excluded)
-                    render()
-                    if (state.directories.length && !state.scanning && !state.syncing) {
-                        setStatus('已恢复 ' + restoredCount + ' 条，正在重新扫描并显示…', 'warn')
-                        await state.scanAndRender()
-                    } else {
-                        setStatus('已恢复 ' + restoredCount + ' 条；请点击“手动扫描”重新显示内容', 'ok')
-                    }
-                })
+                restoreAll.addEventListener('click', () => restoreExcludedEntries(entries))
                 historyHead.appendChild(restoreAll)
             }
             excludedHistory.appendChild(historyHead)
@@ -3687,23 +3830,7 @@
                 restore.className = 'missav-115-local-dir-action'
                 restore.type = 'button'
                 restore.textContent = '恢复'
-                restore.addEventListener('click', async () => {
-                    delete state.excluded[entry.key]
-                    state.matches.forEach(item => {
-                        if (getLocalSyncRecordKey(item.record) === entry.key) {
-                            item.excluded = false
-                            item.selected = true
-                        }
-                    })
-                    saveLocalSyncExclusions(state.excluded)
-                    render()
-                    if (state.directories.length && !state.scanning && !state.syncing) {
-                        setStatus('已恢复：' + (entry.name || '该文件') + '，正在重新扫描…', 'warn')
-                        await state.scanAndRender()
-                    } else {
-                        setStatus('已恢复：' + (entry.name || '该文件') + '；请点击“手动扫描”重新显示', 'ok')
-                    }
-                })
+                restore.addEventListener('click', () => restoreExcludedEntries([entry]))
                 row.appendChild(restore)
                 excludedHistory.appendChild(row)
             })
@@ -7136,3 +7263,4 @@
         if (globalSpeedInterval) clearInterval(globalSpeedInterval);
     });
 })();
+
