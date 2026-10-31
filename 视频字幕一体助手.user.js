@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.31.3
+// @version      2026.10.31.4
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -3355,6 +3355,7 @@
             '.missav-115-local-excluded.open{display:grid;gap:4px;}',
             '.missav-115-local-excluded-head{display:flex;align-items:center;justify-content:space-between;gap:5px;color:#fecaca;font-size:10px;font-weight:700;}',
             '.missav-115-local-excluded-row{display:flex;align-items:center;gap:5px;color:#fecaca;font-size:10px;}',
+            '.missav-115-local-excluded-code{flex:0 0 auto;color:#fde68a;font-weight:700;white-space:nowrap;}',
             '.missav-115-local-excluded-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
             '.missav-115-local-empty{padding:10px 4px;color:#94a3b8;text-align:center;font-size:11px;}',
             '.missav-115-local-hint{margin-top:8px;color:#8fa6b8;font-size:10px;line-height:1.4;}',
@@ -3823,10 +3824,15 @@
             entries.forEach(entry => {
                 const row = document.createElement('div')
                 row.className = 'missav-115-local-excluded-row'
-                row.style.cssText = 'display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;align-items:center;gap:5px;'
+                row.style.cssText = 'display:grid!important;grid-template-columns:auto minmax(0,1fr) auto!important;align-items:center;gap:5px;'
+                const code = document.createElement('span')
+                code.className = 'missav-115-local-excluded-code'
+                code.textContent = entry.code || '未编号'
+                code.title = entry.code || ''
+                row.appendChild(code)
                 const name = document.createElement('span')
                 name.className = 'missav-115-local-excluded-name'
-                name.textContent = (entry.code ? entry.code + ' · ' : '') + (entry.name || entry.relativePath || '未命名文件')
+                name.textContent = entry.name || entry.relativePath || '未命名文件'
                 name.title = [entry.sourceName, entry.relativePath].filter(Boolean).join(' / ')
                 row.appendChild(name)
                 const restore = document.createElement('button')
