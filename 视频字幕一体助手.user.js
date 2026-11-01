@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.01.2
+// @version      2026.11.01.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -58,7 +58,6 @@
 // @match        *://*.115.com/*
 // @match        *://www.madou.io/*
 // @match        *://91porna.com/*
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
 // @require      https://cdn.jsdelivr.net/npm/mux.js@7.0.0/dist/mux.min.js
 // @require      https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js
 // @grant        GM_addStyle
@@ -5706,14 +5705,6 @@
         } catch(e) { return []; }
     }
 
-    async function searchYify(keyword) {
-        return new Promise(resolve => requestAPI({method:'GET', url:'https://yifysubtitles.ch/search?q='+encodeURIComponent(keyword), timeout:15000,
-            onload:r => { const html=r.responseText||''; const links=[...html.matchAll(/href=["'](\/subtitles\/[^"']+)["']/gi)].map(m=>m[1]); resolve([...new Set(links)].slice(0,8).map(path=>({source:'YIFY Subtitles',name:path.split('/').pop().replace(/-/g,' '),url:'https://yifysubtitles.ch'+path,webProvider:'yify'}))); }, onerror:()=>resolve([])}));
-    }
-    async function loadYifySubtitle(pageUrl) {
-        return new Promise((resolve,reject)=>requestAPI({method:'GET',url:pageUrl,timeout:15000,onload:r=>{const m=(r.responseText||'').match(/href=["'](\/subtitle\/[^"']+\.zip)["']/i); if(!m)return reject(new Error('未找到字幕文件')); requestAPI({method:'GET',url:'https://yifysubtitles.ch'+m[1],responseType:'arraybuffer',onload:z=>{JSZip.loadAsync(z.response).then(zip=>{const f=Object.values(zip.files).find(x=>/\.(srt|vtt|ass)$/i.test(x.name)); if(!f)return reject(new Error('压缩包内无字幕')); f.async('text').then(resolve).catch(reject);}).catch(reject)},onerror:reject});},onerror:reject}));
-    }
-
     function normalizeSubtitleKeyword(keyword) {
         return String(keyword || '').trim().replace(/\s+/g, ' ').toUpperCase()
     }
@@ -6298,7 +6289,6 @@
             div.querySelector('.av-115-sub-btn').onclick = (e) => { e.stopPropagation(); saveSubtitleItemTo115(item, e.currentTarget); };
             div.onclick = () => { rememberSubtitleSelection(currentKeyword, item); updateSubtitleSelectionHighlight(item); if (item.text) { state.subtitleData = parseSRT(item.text, state.subtitleOffset); if (state.currentVideo) createSubtitleOverlay(state.currentVideo); showToast('字幕狗字幕加载成功'); return; }
                     if (item.browser) { GM_openInTab(item.url, {active:true, insert:true}); return; }
-                    if (item.webProvider === 'yify') { loadYifySubtitle(item.url).then(text => { state.subtitleData = parseSRT(text, state.subtitleOffset); if (state.currentVideo) createSubtitleOverlay(state.currentVideo); showToast('YIFY 字幕加载成功'); }).catch(() => showToast('YIFY 字幕加载失败')); return; }
                     loadRemoteSubtitle(item.url); subtitleList.remove(); };
             subtitleList.appendChild(div);
         });
@@ -6338,7 +6328,6 @@
 
     async function getSubtitleTextFor115(item) {
         if (item && item.text) return String(item.text)
-        if (item && item.webProvider === 'yify') return await loadYifySubtitle(item.url)
         const url = String(item && item.url || '')
         if (/^data:/i.test(url)) {
             const comma = url.indexOf(',')
@@ -6547,12 +6536,6 @@
                         state.subtitleData = parseSRT(item.text, state.subtitleOffset)
                         if (state.currentVideo) createSubtitleOverlay(state.currentVideo)
                         showToast('字幕加载成功')
-                    } else if (item.webProvider === 'yify') {
-                        loadYifySubtitle(item.url).then(t => {
-                            state.subtitleData = parseSRT(t, state.subtitleOffset)
-                            if (state.currentVideo) createSubtitleOverlay(state.currentVideo)
-                            showToast('YIFY字幕加载成功')
-                        }).catch(() => showToast('YIFY字幕加载失败'))
                     } else {
                         loadRemoteSubtitle(item.url)
                     }
@@ -6563,7 +6546,7 @@
 
         subtitleSearchRefresh = render
         render()
-        const jobs = [searchXunlei(keyword), searchSubDog(keyword), searchSubtitleCat(keyword), searchYify(keyword)]
+        const jobs = [searchXunlei(keyword), searchSubDog(keyword), searchSubtitleCat(keyword)]
         await Promise.all(jobs.map(p => p.then(items => {
             if (searchId !== subtitleSearchSequence) return
             mergeSubtitleResults(all, items, keyword)
