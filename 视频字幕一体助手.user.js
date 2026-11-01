@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.01.3
+// @version      2026.11.01.4
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -2320,7 +2320,7 @@
     const LOCAL_SYNC_CONFIRM_INTERVAL = 60000
     const LOCAL_SYNC_CONFIRM_MAX_ATTEMPTS = 10
     const LOCAL_SYNC_UPLOAD_TIMEOUT = 1800000
-    const LOCAL_SYNC_CONCURRENCY = 3
+    const LOCAL_SYNC_CONCURRENCY = 4
     const LOCAL_SYNC_CHANNEL = 'missav-115-local-sync-v1'
     const LOCAL_SYNC_VIDEO_EXTENSIONS = /\.(mp4|m4v|mkv|wmv|avi|mov|flv|ts|m2ts|webm|mpeg|mpg|3gp|rmvb|vob)$/i
     const LOCAL_SYNC_SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|vtt|sup)$/i
