@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.01.1
+// @version      2026.11.01.2
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -2473,6 +2473,11 @@
                     else result = !current
                     return
                 }
+                if (action === 'force') {
+                    store.put({ owner: owner, expiresAt: now + LOCAL_SYNC_LEASE_TTL }, LOCAL_SYNC_LEASE_KEY)
+                    result = true
+                    return
+                }
                 const ownedByOther = current && current.owner !== owner && Number(current.expiresAt) > now
                 if (ownedByOther) return
                 store.put({ owner: owner, expiresAt: now + LOCAL_SYNC_LEASE_TTL }, LOCAL_SYNC_LEASE_KEY)
@@ -2484,8 +2489,8 @@
         }))
     }
 
-    function acquireLocalSyncLease(owner) {
-        return updateLocalSyncLease(owner, 'acquire')
+    function acquireLocalSyncLease(owner, force) {
+        return updateLocalSyncLease(owner, force ? 'force' : 'acquire')
     }
 
     function renewLocalSyncLease(owner) {
@@ -3433,7 +3438,7 @@
             directories: [], records: [], matches: [], scanning: false, syncing: false, remoteChanged: false,
             folderPromises: new Map(), collapsedGroups: {}, scanAndRender: null, renderCurrent: null, setStatusCurrent: null,
             syncTask: null, taskLoading: false, taskLoadStarted: false, refreshSyncTask: null,
-            syncingItems: new Map(), syncSnapshotQueue: Promise.resolve(), stopAllSyncRequested: false,
+            syncingItems: new Map(), syncSnapshotQueue: Promise.resolve(), stopAllSyncRequested: false, pendingSyncItems: null,
             syncLeaseOwner: '', syncLeaseTimer: null, syncLeaseLost: false, syncLeasePagehideBound: false,
             statusText: '请选择要检查的本地目录', statusType: 'warn',
             hideExisting: getLocalSyncBooleanSetting(LOCAL_SYNC_HIDE_EXISTING_KEY, false),
@@ -3446,6 +3451,7 @@
         state.syncingItems = state.syncingItems || new Map()
         state.syncSnapshotQueue = state.syncSnapshotQueue || Promise.resolve()
         state.stopAllSyncRequested = Boolean(state.stopAllSyncRequested)
+        state.pendingSyncItems = Array.isArray(state.pendingSyncItems) ? state.pendingSyncItems : null
         state.taskLoading = Boolean(state.taskLoading)
         state.taskLoadStarted = Boolean(state.taskLoadStarted)
         state.syncLeaseOwner = String(state.syncLeaseOwner || '')
@@ -3657,11 +3663,17 @@
         stopAllButton.type = 'button'
         stopAllButton.textContent = '停止全部同步'
         stopAllButton.title = '停止当前所有上传，已完成文件保留，未完成文件稍后可继续'
+        const forceLeaseButton = document.createElement('button')
+        forceLeaseButton.className = 'missav-115-local-button danger'
+        forceLeaseButton.type = 'button'
+        forceLeaseButton.textContent = '强制接管同步'
+        forceLeaseButton.title = '确认其他窗口已经停止或卡住时，接管同步锁并停止旧窗口任务'
+        forceLeaseButton.style.display = 'none'
         syncSelected.disabled = true
         syncAll.disabled = true
         refreshTaskButton.disabled = false
         stopAllButton.disabled = true
-        syncRow.append(syncSelected, syncAll, refreshTaskButton, stopAllButton)
+        syncRow.append(syncSelected, syncAll, refreshTaskButton, stopAllButton, forceLeaseButton)
         controls.appendChild(syncRow)
 
         const filterRow = document.createElement('div')
@@ -4077,6 +4089,30 @@
             })
             setStatus('正在停止全部同步；已完成文件保留，未完成文件会保存为待继续', 'warn')
         }
+        const forceTakeOverSyncLease = async () => {
+            const items = state.pendingSyncItems && state.pendingSyncItems.length
+                ? state.pendingSyncItems.slice()
+                : getPending()
+            if (!items.length) {
+                forceLeaseButton.style.display = 'none'
+                setStatus('当前没有待同步文件', 'ok')
+                return
+            }
+            const owner = state.syncLeaseOwner || (typeof createLocalSyncLeaseOwner === 'function' ? createLocalSyncLeaseOwner() : 'local-sync')
+            forceLeaseButton.disabled = true
+            setStatus('正在接管同步锁，并通知旧窗口停止…', 'warn')
+            try {
+                const acquired = typeof acquireLocalSyncLease === 'function' ? await acquireLocalSyncLease(owner, true) : true
+                if (!acquired) throw new Error('无法接管同步锁')
+                state.syncLeaseOwner = owner
+                state.pendingSyncItems = null
+                forceLeaseButton.style.display = 'none'
+                await syncItems(items)
+            } catch (error) {
+                forceLeaseButton.disabled = false
+                setStatus('强制接管失败：' + (error && error.message || error || '未知错误'), 'error')
+            }
+        }
         const syncItems = async items => {
             if (state.syncing || !state.directories.length) return
             const requestedItems = (Array.isArray(items) ? items : []).filter(item => item && !isItemExcluded(item) && !item.exists && item.status !== 'synced')
@@ -4093,9 +4129,14 @@
             const leaseOwner = state.syncLeaseOwner || (typeof createLocalSyncLeaseOwner === 'function' ? createLocalSyncLeaseOwner() : 'local-sync')
             const leaseAcquired = typeof acquireLocalSyncLease === 'function' ? await acquireLocalSyncLease(leaseOwner) : true
             if (!leaseAcquired) {
-                state.setStatusCurrent('另一个窗口正在同步此任务，请稍后点击“刷新同步状态”', 'warn')
+                state.pendingSyncItems = requestedItems.slice()
+                forceLeaseButton.disabled = false
+                forceLeaseButton.style.display = 'inline-block'
+                state.setStatusCurrent('另一个窗口正在同步此任务；确认旧窗口已停止后，可点击“强制接管同步”', 'warn')
                 return
             }
+            forceLeaseButton.style.display = 'none'
+            state.pendingSyncItems = null
             state.syncLeaseOwner = leaseOwner
             state.syncLeaseLost = false
             if (!state.syncLeaseTimer && typeof setInterval === 'function') {
@@ -4103,6 +4144,11 @@
                     renewLocalSyncLease(leaseOwner).then(ok => {
                         if (!ok) {
                             state.syncLeaseLost = true
+                            state.stopAllSyncRequested = true
+                            state.syncingItems.forEach(item => {
+                                item.syncStopRequested = true
+                                item.syncController && item.syncController.abort()
+                            })
                             state.setStatusCurrent('同步锁已被其他窗口接管，当前任务将在本轮结束后暂停', 'error')
                         }
                     }).catch(() => {})
@@ -4331,6 +4377,7 @@
         state.refreshSyncTask = refreshSyncTask
         refreshTaskButton.addEventListener('click', () => refreshSyncTask(false))
         stopAllButton.addEventListener('click', stopAllSync)
+        forceLeaseButton.addEventListener('click', forceTakeOverSyncLease)
         if (!state.taskLoadStarted) {
             state.taskLoadStarted = true
             loadLocalSyncDirectoryHandles().then(handles => {
