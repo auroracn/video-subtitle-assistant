@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.10.31.4
+// @version      2026.11.01.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -2321,6 +2321,7 @@
     const LOCAL_SYNC_CONFIRM_INTERVAL = 60000
     const LOCAL_SYNC_CONFIRM_MAX_ATTEMPTS = 10
     const LOCAL_SYNC_UPLOAD_TIMEOUT = 1800000
+    const LOCAL_SYNC_CONCURRENCY = 3
     const LOCAL_SYNC_CHANNEL = 'missav-115-local-sync-v1'
     const LOCAL_SYNC_VIDEO_EXTENSIONS = /\.(mp4|m4v|mkv|wmv|avi|mov|flv|ts|m2ts|webm|mpeg|mpg|3gp|rmvb|vob)$/i
     const LOCAL_SYNC_SUBTITLE_EXTENSIONS = /\.(srt|ass|ssa|vtt|sup)$/i
@@ -3029,10 +3030,14 @@
         return get115UploadInitData(payload)
     }
 
-    function uploadLocalSyncToOss(file, uploadInfo, onProgress) {
+    function uploadLocalSyncToOss(file, uploadInfo, onProgress, signal) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
                 reject(new Error('脚本没有 GM_xmlhttpRequest 权限，无法上传本地文件'))
+                return
+            }
+            if (signal && signal.aborted) {
+                reject(new DOMException('同步已停止', 'AbortError'))
                 return
             }
             const form = new FormData()
@@ -3044,14 +3049,34 @@
             form.append('callback', uploadInfo.callback || '')
             form.append('signature', uploadInfo.signature)
             form.append('file', file, file.name)
-            GM_xmlhttpRequest({
+            let request = null
+            let settled = false
+            const abortRequest = () => {
+                try { request && request.abort() } catch (error) {}
+                rejectOnce(new DOMException('同步已停止', 'AbortError'))
+            }
+            const cleanup = () => signal && signal.removeEventListener('abort', abortRequest)
+            const resolveOnce = value => {
+                if (settled) return
+                settled = true
+                cleanup()
+                resolve(value)
+            }
+            const rejectOnce = error => {
+                if (settled) return
+                settled = true
+                cleanup()
+                reject(error)
+            }
+            signal && signal.addEventListener('abort', abortRequest, { once: true })
+            request = GM_xmlhttpRequest({
                 method: 'POST', url: uploadInfo.host, data: form, anonymous: true, timeout: LOCAL_SYNC_UPLOAD_TIMEOUT,
                 onprogress: event => { if (typeof onProgress === 'function') onProgress(event) },
                 onload: response => {
                     if (Number(response.status) < 200 || Number(response.status) >= 300) {
                         const error = new Error('对象存储上传失败（HTTP ' + response.status + '）')
                         error.status = Number(response.status) || 0
-                        reject(error)
+                        rejectOnce(error)
                         return
                     }
                     let payload = null
@@ -3059,14 +3084,14 @@
                     if (payload && payload.state === false) {
                         const error = new Error(payload.error_msg || payload.message || '115 回调报告上传失败')
                         error.status = Number(response.status) || 0
-                        reject(error)
+                        rejectOnce(error)
                         return
                     }
-                    resolve(response)
+                    resolveOnce(response)
                 },
-                ontimeout: () => reject(Object.assign(new Error('本地文件上传超时'), { status: 0 })),
-                onabort: () => reject(Object.assign(new Error('本地文件上传已中止'), { status: 0 })),
-                onerror: () => reject(Object.assign(new Error('本地文件上传失败（网络或跨域被拦截）'), { status: 0 }))
+                ontimeout: () => rejectOnce(Object.assign(new Error('本地文件上传超时'), { status: 0 })),
+                onabort: () => rejectOnce(Object.assign(new Error('本地文件上传已中止'), { status: 0 })),
+                onerror: () => rejectOnce(Object.assign(new Error('本地文件上传失败（网络或跨域被拦截）'), { status: 0 }))
             })
         })
     }
@@ -3084,21 +3109,41 @@
         const maxAttempts = Number.isFinite(Number(config.maxAttempts))
             ? Math.max(1, Math.floor(Number(config.maxAttempts)))
             : LOCAL_SYNC_CONFIRM_MAX_ATTEMPTS
+        const signal = config.signal
         let attempt = 0
         while (attempt < maxAttempts) {
+            if (signal && signal.aborted) throw new DOMException('同步已停止', 'AbortError')
             attempt += 1
             try {
                 const remote = await find115FileInFolder(parentCid, name)
+                if (signal && signal.aborted) throw new DOMException('同步已停止', 'AbortError')
                 if (remote) return remote
                 if (typeof onCheck === 'function') onCheck(attempt, null)
             } catch (error) {
+                if (signal && signal.aborted) throw new DOMException('同步已停止', 'AbortError')
                 const status = Number(error && error.status) || 0
                 const permanentClientError = status >= 400 && status < 500 && status !== 429
                 if (error && error.type === 'auth' || permanentClientError) throw error
                 if (typeof onCheck === 'function') onCheck(attempt, error)
             }
             if (attempt >= maxAttempts) break
-            await new Promise(resolve => setTimeout(resolve, intervalMs))
+            await new Promise((resolve, reject) => {
+                if (signal && signal.aborted) {
+                    reject(new DOMException('同步已停止', 'AbortError'))
+                    return
+                }
+                let timer = null
+                const abort = () => {
+                    if (timer) clearTimeout(timer)
+                    signal && signal.removeEventListener('abort', abort)
+                    reject(new DOMException('同步已停止', 'AbortError'))
+                }
+                timer = setTimeout(() => {
+                    signal && signal.removeEventListener('abort', abort)
+                    resolve()
+                }, intervalMs)
+                signal && signal.addEventListener('abort', abort, { once: true })
+            })
         }
         throw new Error('115入库核对超时：' + name + '；已检查 ' + attempt + ' 次')
     }
@@ -3133,7 +3178,9 @@
         return String(result && result.uploadName || '') || stem + '.syncing-' + Date.now() + extension
     }
 
-    async function uploadLocalSyncFile(result, folderCid, onProgress, replaceRemote, onCheck) {
+    async function uploadLocalSyncFile(result, folderCid, onProgress, replaceRemote, onCheck, options) {
+        const signal = options && options.signal
+        if (signal && signal.aborted) throw new DOMException('同步已停止', 'AbortError')
         const record = result.record
         const file = record.fileHandle && record.fileHandle.getFile ? await record.fileHandle.getFile() : record.file
         if (!file || !file.size) throw new Error('无法读取本地文件：' + record.name)
@@ -3149,12 +3196,12 @@
             const uploadInfo = await init115LocalSyncUpload(uploadFile, folderCid)
             uploadResponse = uploadInfo.instant
                 ? { status: 200, instant: true }
-                : await uploadLocalSyncToOss(uploadFile, uploadInfo, onProgress)
+                : await uploadLocalSyncToOss(uploadFile, uploadInfo, onProgress, signal)
         }
         const uploadedName = shouldReplace ? tempName : record.name
         let remote = existingTemp
         try {
-            remote = await waitFor115FileInFolder(folderCid, uploadedName, onCheck)
+            remote = await waitFor115FileInFolder(folderCid, uploadedName, onCheck, { signal: signal })
         } catch (error) {
             throw new Error(describe115UploadFailure(error, uploadResponse, uploadedName))
         }
@@ -3162,7 +3209,7 @@
         if (shouldReplace) {
             await delete115LocalSyncFile(replaceRemote, folderCid)
             await rename115LocalSyncFile(remote, record.name)
-            const finalRemote = await waitFor115FileInFolder(folderCid, record.name, onCheck)
+            const finalRemote = await waitFor115FileInFolder(folderCid, record.name, onCheck, { signal: signal })
             if (!finalRemote) throw new Error('旧字幕已处理，但替换后的同名字幕未确认入库')
             result.uploadName = ''
             return finalRemote
@@ -3313,6 +3360,12 @@
         return Promise.all(saves).then(() => undefined)
     }
 
+    function enqueueLocalSyncSnapshot(state, status) {
+        const previous = state.syncSnapshotQueue || Promise.resolve()
+        state.syncSnapshotQueue = previous.catch(() => {}).then(() => snapshotLocalSyncTask(state, status))
+        return state.syncSnapshotQueue
+    }
+
     function ensure115LocalSyncStyles() {
         if (document.getElementById('missav-115-local-sync-styles')) return
         const style = document.createElement('style')
@@ -3335,7 +3388,7 @@
             '.missav-115-local-dir-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd5e1;}',
             '.missav-115-local-dir-action{border:0;border-radius:3px;padding:2px 5px;background:#475569;color:#e2e8f0;font-size:10px;cursor:pointer;}.missav-115-local-dir-action:disabled{opacity:.35;cursor:not-allowed;}',
             '.missav-115-local-button{min-height:28px;padding:0 8px;border:0;border-radius:5px;background:#0ea5e9;color:#082f49;font-size:11px;font-weight:700;cursor:pointer;}',
-            '.missav-115-local-button.secondary{background:#334155;color:#e2e8f0;}.missav-115-local-button.success{background:#22c55e;color:#052e16;}.missav-115-local-button:disabled{opacity:.5;cursor:not-allowed;}',
+            '.missav-115-local-button.secondary{background:#334155;color:#e2e8f0;}.missav-115-local-button.success{background:#22c55e;color:#052e16;}.missav-115-local-button.danger{background:#b91c1c;color:#fee2e2;}.missav-115-local-button:disabled{opacity:.5;cursor:not-allowed;}',
             '.missav-115-local-input{min-width:0;flex:1;height:28px;padding:0 7px;border:1px solid #475569;border-radius:5px;background:#0f172a;color:#e2e8f0;font-size:11px;}',
             '.missav-115-local-list{display:grid;gap:6px;margin-top:9px;}',
             '.missav-115-local-group{padding:7px;border:1px solid rgba(56,189,248,.25);border-radius:7px;background:rgba(15,23,42,.62);}',
@@ -3380,6 +3433,7 @@
             directories: [], records: [], matches: [], scanning: false, syncing: false, remoteChanged: false,
             folderPromises: new Map(), collapsedGroups: {}, scanAndRender: null, renderCurrent: null, setStatusCurrent: null,
             syncTask: null, taskLoading: false, taskLoadStarted: false, refreshSyncTask: null,
+            syncingItems: new Map(), syncSnapshotQueue: Promise.resolve(), stopAllSyncRequested: false,
             syncLeaseOwner: '', syncLeaseTimer: null, syncLeaseLost: false, syncLeasePagehideBound: false,
             statusText: '请选择要检查的本地目录', statusType: 'warn',
             hideExisting: getLocalSyncBooleanSetting(LOCAL_SYNC_HIDE_EXISTING_KEY, false),
@@ -3389,6 +3443,9 @@
         state.folderPromises = state.folderPromises || new Map()
         state.collapsedGroups = state.collapsedGroups || {}
         state.syncTask = state.syncTask || null
+        state.syncingItems = state.syncingItems || new Map()
+        state.syncSnapshotQueue = state.syncSnapshotQueue || Promise.resolve()
+        state.stopAllSyncRequested = Boolean(state.stopAllSyncRequested)
         state.taskLoading = Boolean(state.taskLoading)
         state.taskLoadStarted = Boolean(state.taskLoadStarted)
         state.syncLeaseOwner = String(state.syncLeaseOwner || '')
@@ -3595,10 +3652,16 @@
         refreshTaskButton.type = 'button'
         refreshTaskButton.textContent = '刷新同步状态'
         refreshTaskButton.title = '独立刷新同步任务，不重新扫描本地目录'
+        const stopAllButton = document.createElement('button')
+        stopAllButton.className = 'missav-115-local-button danger'
+        stopAllButton.type = 'button'
+        stopAllButton.textContent = '停止全部同步'
+        stopAllButton.title = '停止当前所有上传，已完成文件保留，未完成文件稍后可继续'
         syncSelected.disabled = true
         syncAll.disabled = true
         refreshTaskButton.disabled = false
-        syncRow.append(syncSelected, syncAll, refreshTaskButton)
+        stopAllButton.disabled = true
+        syncRow.append(syncSelected, syncAll, refreshTaskButton, stopAllButton)
         controls.appendChild(syncRow)
 
         const filterRow = document.createElement('div')
@@ -3748,7 +3811,7 @@
         }
         const isItemExcluded = item => Boolean(item && (item.excluded || state.excluded[getLocalSyncRecordKey(item.record)]))
         const isExistingItem = item => Boolean(item && (item.exists || item.status === 'exists' || item.status === 'synced'))
-        const getPending = () => state.matches.filter(item => !isItemExcluded(item) && !item.exists && ['pending', 'replace', 'failed', 'check-error'].includes(item.status))
+        const getPending = () => state.matches.filter(item => !isItemExcluded(item) && !item.exists && ['pending', 'replace', 'failed', 'check-error', 'paused'].includes(item.status))
         const matchesExcludedEntry = (record, entry) => {
             if (!record || !entry) return false
             if (entry.key && getLocalSyncRecordKey(record) === String(entry.key)) return true
@@ -3880,7 +3943,7 @@
                 groupButton.className = 'missav-115-local-group-sync'
                 groupButton.type = 'button'
                 groupButton.textContent = '同步该番号'
-                groupButton.disabled = state.syncing || !items.some(item => !item.exists && ['pending', 'replace', 'failed', 'check-error'].includes(item.status))
+                groupButton.disabled = state.syncing || !items.some(item => !item.exists && ['pending', 'replace', 'failed', 'check-error', 'paused'].includes(item.status))
                 groupButton.addEventListener('click', event => {
                     event.preventDefault()
                     event.stopPropagation()
@@ -3921,11 +3984,21 @@
                     info.appendChild(meta)
                     row.appendChild(info)
                     const stateText = document.createElement('span')
-                    stateText.className = 'missav-115-local-file-state ' + (item.status === 'exists' || item.status === 'synced' || item.status === 'replace' ? item.status : item.status === 'check-error' || item.status === 'failed' ? 'error' : '')
-                    stateText.textContent = item.exists ? '已存在' : item.status === 'syncing' ? '同步中' : item.status === 'synced' ? '已同步' : item.status === 'replace' ? '优先替换' : item.status === 'check-error' ? '查询失败' : item.status === 'failed' ? '失败' : '待同步'
+                    stateText.className = 'missav-115-local-file-state ' + (item.status === 'exists' || item.status === 'synced' || item.status === 'replace' ? item.status : item.status === 'check-error' || item.status === 'failed' || item.status === 'paused' ? 'error' : '')
+                    stateText.textContent = item.exists ? '已存在' : item.status === 'syncing' ? '同步中' : item.status === 'synced' ? '已同步' : item.status === 'replace' ? '优先替换' : item.status === 'check-error' ? '查询失败' : item.status === 'failed' ? '失败' : item.status === 'paused' ? '已停止' : '待同步'
                     stateText.title = item.error || (item.remote && item.remote.name) || ''
                     row.appendChild(stateText)
-                    if (!item.exists && item.status !== 'syncing') {
+                    if (!item.exists && item.status === 'syncing') {
+                        const stopButton = document.createElement('button')
+                        stopButton.className = 'missav-115-local-file-sync'
+                        stopButton.type = 'button'
+                        stopButton.textContent = '停止'
+                        stopButton.title = '停止这个文件的同步，其他文件继续'
+                        stopButton.style.background = '#ef4444'
+                        stopButton.style.color = '#fff1f2'
+                        stopButton.addEventListener('click', () => stopSyncItem(item))
+                        row.appendChild(stopButton)
+                    } else if (!item.exists) {
                         const syncButton = document.createElement('button')
                         syncButton.className = 'missav-115-local-file-sync'
                         syncButton.type = 'button'
@@ -3986,7 +4059,23 @@
             syncSelected.disabled = state.syncing || !pending.some(item => item.selected)
             syncAll.disabled = state.syncing || pending.length === 0
             refreshTaskButton.disabled = state.syncing || state.scanning || state.taskLoading
+            stopAllButton.disabled = !state.syncing || !state.syncingItems.size
             rescanButton.disabled = state.scanning || state.syncing || !state.directories.length
+        }
+        const stopSyncItem = item => {
+            if (!item || !item.syncController) return
+            item.syncStopRequested = true
+            item.syncController.abort()
+            setStatus('正在停止：' + item.record.name + '；其他文件继续同步', 'warn')
+        }
+        const stopAllSync = () => {
+            if (!state.syncingItems.size) return
+            state.stopAllSyncRequested = true
+            state.syncingItems.forEach(item => {
+                item.syncStopRequested = true
+                item.syncController && item.syncController.abort()
+            })
+            setStatus('正在停止全部同步；已完成文件保留，未完成文件会保存为待继续', 'warn')
         }
         const syncItems = async items => {
             if (state.syncing || !state.directories.length) return
@@ -4020,17 +4109,33 @@
                 }, LOCAL_SYNC_LEASE_RENEW_INTERVAL)
             }
             state.syncing = true
+            state.stopAllSyncRequested = false
             updateButtons()
+            state.setStatusCurrent('正在并发同步 ' + requestedItems.length + ' 个文件（最多 ' + LOCAL_SYNC_CONCURRENCY + ' 个同时上传）', 'warn')
             try {
-                await snapshotLocalSyncTask(state, 'running')
-                for (const item of requestedItems) {
-                    const leaseValid = typeof renewLocalSyncLease === 'function' ? await renewLocalSyncLease(leaseOwner) : true
-                    if (state.syncLeaseLost || !leaseValid) throw new Error('同步锁已失效，请点击“刷新同步状态”继续')
-                    if (isItemExcluded(item) || item.exists || item.status === 'synced') continue
-                    item.status = 'syncing'; item.error = ''; state.renderCurrent()
-                    await snapshotLocalSyncTask(state, 'running')
+                await enqueueLocalSyncSnapshot(state, 'running')
+                const processSyncItem = async item => {
+                    if (isItemExcluded(item) || item.exists || item.status === 'synced') return
+                    if (state.stopAllSyncRequested) {
+                        item.status = 'paused'
+                        item.error = '已停止全部同步，可继续同步'
+                        await enqueueLocalSyncSnapshot(state, 'running')
+                        state.renderCurrent()
+                        return
+                    }
+                    const itemKey = getLocalSyncRecordKey(item.record)
+                    const controller = new AbortController()
+                    item.syncController = controller
+                    item.syncStopRequested = false
+                    state.syncingItems.set(itemKey, item)
+                    item.status = 'syncing'; item.error = ''; state.renderCurrent(); updateButtons()
                     try {
+                        const leaseValid = typeof renewLocalSyncLease === 'function' ? await renewLocalSyncLease(leaseOwner) : true
+                        if (state.syncLeaseLost || !leaseValid) throw new Error('同步锁已失效，请点击“刷新同步状态”继续')
+                        if (controller.signal.aborted) throw new DOMException('同步已停止', 'AbortError')
+                        await enqueueLocalSyncSnapshot(state, 'running')
                         const freshItems = await query115LocalSyncRemoteFiles(item.record.code)
+                        if (controller.signal.aborted) throw new DOMException('同步已停止', 'AbortError')
                         const groupRecords = state.matches
                             .filter(match => match.record.code === item.record.code)
                             .map(match => match.record)
@@ -4038,8 +4143,9 @@
                         const shouldReplace = Boolean(item.replaceExisting && item.record.kind === 'subtitle')
                         if (freshRemote && !shouldReplace) {
                             applyLocalSyncRemoteToSameName(state, item, freshRemote, 'exists')
-                            await snapshotLocalSyncTask(state, 'running')
-                            state.renderCurrent(); continue
+                            await enqueueLocalSyncSnapshot(state, 'running')
+                            state.renderCurrent()
+                            return
                         }
                         let folderPromise = state.folderPromises.get(item.record.code)
                         if (!folderPromise) {
@@ -4047,29 +4153,45 @@
                             state.folderPromises.set(item.record.code, folderPromise)
                         }
                         const folderCid = await folderPromise
+                        if (controller.signal.aborted) throw new DOMException('同步已停止', 'AbortError')
                         item.folderCid = folderCid
                         if (item.replaceExisting && item.record.kind === 'subtitle') item.uploadName = getLocalSyncUploadName(item)
-                        await snapshotLocalSyncTask(state, 'running')
+                        await enqueueLocalSyncSnapshot(state, 'running')
                         const replaceRemote = shouldReplace ? await find115FileInFolder(folderCid, item.record.name) : null
+                        if (controller.signal.aborted) throw new DOMException('同步已停止', 'AbortError')
                         item.remote = await uploadLocalSyncFile(item, folderCid, event => {
                             if (event && event.total) state.setStatusCurrent('正在上传 ' + item.record.name + '：' + Math.round(event.loaded / event.total * 100) + '%', 'warn')
                         }, replaceRemote, (attempt, error) => {
                             state.setStatusCurrent('持续检测 ' + item.record.name + ' 是否已完成（第 ' + attempt + ' 次）' + (error ? '，网络暂时异常，继续重试' : ''), 'warn')
-                        })
+                        }, { signal: controller.signal })
                         applyLocalSyncRemoteToSameName(state, item, item.remote, 'synced')
                     } catch (error) {
-                        item.status = 'failed'; item.error = error && error.message || String(error || '同步失败')
+                        const stopped = item.syncStopRequested || controller.signal.aborted || error && error.name === 'AbortError'
+                        item.status = stopped ? 'paused' : 'failed'
+                        item.error = stopped ? '已手动停止，可继续同步' : error && error.message || String(error || '同步失败')
+                    } finally {
+                        item.syncController = null
+                        state.syncingItems.delete(itemKey)
+                        await enqueueLocalSyncSnapshot(state, 'running')
+                        state.renderCurrent()
                     }
-                    await snapshotLocalSyncTask(state, 'running')
-                    state.renderCurrent()
                 }
+                let nextItemIndex = 0
+                const syncWorker = async () => {
+                    while (true) {
+                        const item = requestedItems[nextItemIndex++]
+                        if (!item) return
+                        await processSyncItem(item)
+                    }
+                }
+                await Promise.all(Array.from({ length: Math.min(LOCAL_SYNC_CONCURRENCY, requestedItems.length) }, () => syncWorker()))
                 const taskKeys = new Set((state.syncTask && state.syncTask.items || []).map(item => item && item.key).filter(Boolean))
                 const taskItems = state.matches.filter(item => taskKeys.has(getLocalSyncRecordKey(item.record)))
                 const failed = taskItems.filter(item => item.status === 'failed' || item.status === 'check-error').length
-                const remaining = taskItems.filter(item => !(item.exists || item.status === 'exists' || item.status === 'synced') && ['pending', 'replace', 'failed', 'check-error'].includes(item.status)).length
+                const remaining = taskItems.filter(item => !(item.exists || item.status === 'exists' || item.status === 'synced') && ['pending', 'replace', 'failed', 'check-error', 'paused'].includes(item.status)).length
                 if (failed || remaining) {
-                    await snapshotLocalSyncTask(state, 'paused')
-                    state.setStatusCurrent('同步暂停：有 ' + (failed || remaining) + ' 个文件未完成，可点击“刷新同步状态”继续；不会因页面刷新丢失任务', 'warn')
+                    await enqueueLocalSyncSnapshot(state, 'paused')
+                    state.setStatusCurrent((state.stopAllSyncRequested ? '已停止同步；' : '同步暂停；') + '有 ' + (failed || remaining) + ' 个文件未完成，可继续同步；不会因页面刷新丢失任务', 'warn')
                 } else {
                     await clearLocalSyncTask()
                     state.syncTask = null
@@ -4078,10 +4200,12 @@
                 notifyLocalSyncChanged()
             } catch (error) {
                 const message = error && error.message || String(error || '同步任务保存失败')
-                try { await snapshotLocalSyncTask(state, 'paused') } catch (saveError) {}
+                try { await enqueueLocalSyncSnapshot(state, 'paused') } catch (saveError) {}
                 state.setStatusCurrent('同步已暂停：' + message + '；可点击“刷新同步状态”继续', 'error')
             } finally {
                 state.syncing = false
+                state.stopAllSyncRequested = false
+                state.syncingItems.clear()
                 state.folderPromises.clear()
                 if (state.syncLeaseTimer) clearInterval(state.syncLeaseTimer)
                 state.syncLeaseTimer = null
@@ -4206,6 +4330,7 @@
         }
         state.refreshSyncTask = refreshSyncTask
         refreshTaskButton.addEventListener('click', () => refreshSyncTask(false))
+        stopAllButton.addEventListener('click', stopAllSync)
         if (!state.taskLoadStarted) {
             state.taskLoadStarted = true
             loadLocalSyncDirectoryHandles().then(handles => {
