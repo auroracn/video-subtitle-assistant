@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.22.2
+// @version      2026.11.22.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.22.2'
+    const VIDEO_SCRIPT_VERSION = '2026.11.22.3'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -6819,9 +6819,9 @@
         video._avBackgroundPlaybackGuard = guard;
         backgroundPlaybackGuards.add(guard);
         guard.installPauseGuard();
-        video.addEventListener('pause', guard.onPause, true);
-        video.addEventListener('play', guard.onPlay, true);
-        video.addEventListener('ended', guard.onEnded, true);
+        video.addEventListener('pause', guard.onPause.bind(guard), true);
+        video.addEventListener('play', guard.onPlay.bind(guard), true);
+        video.addEventListener('ended', guard.onEnded.bind(guard), true);
     }
 
     function canBeControlled(video) {
