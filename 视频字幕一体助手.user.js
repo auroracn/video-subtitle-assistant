@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.19
+// @version      2026.11.23.20
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.19'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.20'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -6518,6 +6518,11 @@
             showVideoDownloadErrorOn115Card(cloudCard, err)
         })
     })
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', installNativeMissav115TransferObserver, { once: true })
+    } else {
+        installNativeMissav115TransferObserver()
+    }
     if (is115UserPage()) {
         install115ParentRenameSync()
         if (document.readyState === 'loading') {
@@ -8463,7 +8468,6 @@
         // 115页面由“本地同步”侧边栏接管，不再显示视频控制/字幕搜索侧边栏。
         if (is115UserPageForVideoAssistant()) return;
 
-        installNativeMissav115TransferObserver();
         createPanel();
         initVideoSelection();
         initListPageDiscovery();
