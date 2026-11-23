@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.8
+// @version      2026.11.23.9
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.8'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.9'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -181,9 +181,6 @@
     const VIDEO_PLAYLIST_REFRESH_INTERVAL = 8 * 60 * 1000
     const VIDEO_PLAYLIST_REFRESH_MIN_GAP = 8000
     const VIDEO_PLAYLIST_FORCE_MIN_GAP = 1200
-    // 115 网页版在线预览对 H.264(8bit 4:2:0) + AAC 的普通 MP4 兼容性最好。
-    // 设为 false 可恢复「无条件选最高分辨率」的旧行为。
-    const VIDEO_PREFER_115_COMPATIBLE_CODEC = true
     const VIDEO_TRANSCODE_COMMAND = 'ffmpeg -i "输入.mp4" -map 0:v:0 -map 0:a? -sn -dn -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -profile:v high -level 4.1 -c:a aac -b:a 128k -ac 2 -movflags +faststart "输出_115.mp4"'
     const VIDEO_TRANSCODE_BAT = [
         '@echo off',
@@ -5670,18 +5667,13 @@
     }
 
     function orderM3u8Variants(variants) {
-        // 存在明确的 H.264+AAC 变体时优先选它：115 在线预览不必等云端转码。
-        const compatible = VIDEO_PREFER_115_COMPATIBLE_CODEC
-            ? variants.filter(item => item.codecInfo && item.codecInfo.friendly === true)
-            : []
-        const compare = (a, b) => {
+        const compareByResolution = (a, b) => {
             return (b.height - a.height) ||
                 (b.width - a.width) ||
-                (b.bandwidth - a.bandwidth)
+                (b.bandwidth - a.bandwidth) ||
+                (Number(Boolean(b.codecInfo && b.codecInfo.friendly)) - Number(Boolean(a.codecInfo && a.codecInfo.friendly)))
         }
-        const preferred = compatible.slice().sort(compare)
-        const rest = variants.filter(item => !preferred.includes(item)).sort(compare)
-        return preferred.concat(rest)
+        return variants.slice().sort(compareByResolution)
     }
 
     function parseM3u8Segments(text, baseUrl) {
