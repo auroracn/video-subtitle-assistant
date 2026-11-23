@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.17
+// @version      2026.11.23.19
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.17'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.19'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -2281,7 +2281,6 @@
     function extractNativeMagnetLink(element) {
         if (!element || !element.attributes) return ''
         const values = Array.from(element.attributes).map(attribute => attribute.value)
-        values.push(element.innerHTML || '')
         const pattern = /magnet:\?[^\s"'<>\\]+/i
         for (const rawValue of values) {
             let value = String(rawValue || '').replace(/&amp;/gi, '&').replace(/\\u0026/gi, '&').replace(/\\\//g, '/')
@@ -2294,20 +2293,7 @@
 
     function isNativeMissavDownloadLink(anchor) {
         if (!anchor || anchor.dataset.missav115TransferBound === '1') return ''
-        const ownMagnet = extractNativeMagnetLink(anchor)
-        if (ownMagnet) return ownMagnet
-        const row = anchor.closest('tr,li,[class*=download],[class*=torrent],[class*=magnet]')
-        const rowMagnet = row ? extractNativeMagnetLink(row) : ''
-        if (rowMagnet) return rowMagnet
-        let parent = anchor.parentElement
-        for (let depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
-            const magnet = extractNativeMagnetLink(parent)
-            if (!magnet) continue
-            const text = String(parent.textContent || '')
-            if (/\.(?:mp4|mkv|avi|wmv|mov|ts|torrent)\b/i.test(text) ||
-                /\d+(?:[.,]\d+)?\s*(?:TB|TIB|GB|GIB|MB|MIB)\b/i.test(text)) return magnet
-        }
-        return ''
+        return extractNativeMagnetLink(anchor)
     }
 
     function attachNativeMissav115TransferButtons(root) {
@@ -2319,8 +2305,10 @@
         candidates.forEach(candidate => {
             const taskUrl = isNativeMissavDownloadLink(candidate)
             if (!taskUrl) return
-            const item = candidate.closest('tr,li,[class*=download],[class*=torrent],[class*=magnet]') || candidate
-            if (item.querySelector('[data-missav115-transfer-bound="1"]')) return
+            const row = candidate.closest('tr,li,[class*=download],[class*=torrent],[class*=magnet]')
+            const item = row || candidate
+            if (item.dataset.missav115TransferBound === '1' ||
+                (row && row.querySelector('[data-missav115-transfer-bound="1"]'))) return
             item.dataset.missav115TransferBound = '1'
             const button = document.createElement('button')
             button.type = 'button'
@@ -2329,7 +2317,11 @@
             button.title = '将此磁力链接提交到当前浏览器登录的 115 离线下载'
             button.style.cssText = 'margin-left:7px;cursor:pointer;'
             button.addEventListener('click', () => submitTo115(taskUrl, button))
-            candidate.insertAdjacentElement('afterend', button)
+            const downloadAction = row && Array.from(row.querySelectorAll('a,button')).find(element => {
+                const label = String(element.textContent || element.getAttribute('aria-label') || element.title || '').trim()
+                return /^(?:下载|download)$/i.test(label) && !element.dataset.missav115TransferBound
+            })
+            ;(downloadAction || candidate).insertAdjacentElement('afterend', button)
         })
     }
 
@@ -5225,7 +5217,7 @@
         const style = document.createElement('style')
         style.id = 'missav-115-cloud-styles'
         style.textContent = [
-            '#missav-115-cloud-card{position:fixed;top:16px;left:16px;z-index:2147483645;width:310px;height:480px;min-width:260px;min-height:180px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);resize:both;overflow:auto;box-sizing:border-box;padding:12px;border:1px solid #f59e0b;border-radius:10px;background:linear-gradient(145deg,#251b0b,#171923);color:#f8fafc;font:13px/1.45 Arial,sans-serif;box-shadow:0 8px 26px rgba(0,0,0,.35);}',
+            '#missav-115-cloud-card{position:fixed;top:16px;left:16px;z-index:2147483645;width:310px;height:800px;min-width:260px;min-height:180px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);resize:both;overflow:auto;box-sizing:border-box;padding:12px;border:1px solid #f59e0b;border-radius:10px;background:linear-gradient(145deg,#251b0b,#171923);color:#f8fafc;font:13px/1.45 Arial,sans-serif;box-shadow:0 8px 26px rgba(0,0,0,.35);}',
             '.missav-115-cloud-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;}',
             '.missav-115-cloud-title{font-weight:800;color:#fde68a;}',
             '.missav-115-cloud-close{border:0;background:transparent;color:#cbd5e1;font-size:18px;line-height:1;cursor:pointer;padding:0 2px;}',
@@ -5252,9 +5244,9 @@
     }
 
     const MISSAV_115_CARD_WIDTH_KEY = 'missav-115-cloud-card-width'
-    const MISSAV_115_CARD_HEIGHT_KEY = 'missav-115-cloud-card-height-v2'
+    const MISSAV_115_CARD_HEIGHT_KEY = 'missav-115-cloud-card-height-v3'
     const MISSAV_115_CARD_DEFAULT_WIDTH = 310
-    const MISSAV_115_CARD_DEFAULT_HEIGHT = 480
+    const MISSAV_115_CARD_DEFAULT_HEIGHT = 800
 
     function read115CardSize(key, fallback, min, max) {
         let value
