@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.14
+// @version      2026.11.23.16
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.14'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.16'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -2274,6 +2274,50 @@
         if (!tab) show115Notice('浏览器阻止了 115 离线页面，请允许弹出窗口后重试。', 'warning', 8000)
     }
 
+    function is115TransferableUrl(value) {
+        return /^magnet:\?/i.test(String(value || '').trim())
+    }
+
+    function isNativeMissavDownloadLink(anchor) {
+        if (!anchor || anchor.dataset.missav115TransferBound === '1') return false
+        const rawHref = String(anchor.getAttribute('href') || '').trim()
+        return is115TransferableUrl(rawHref)
+    }
+
+    function attachNativeMissav115TransferButtons(root) {
+        if (!document.body || !location.hostname.toLowerCase().includes('missav')) return
+        const scope = root && root.querySelectorAll ? root : document
+        const anchors = []
+        if (scope.matches && scope.matches('a[href]')) anchors.push(scope)
+        anchors.push(...scope.querySelectorAll('a[href]'))
+        anchors.forEach(anchor => {
+            if (!isNativeMissavDownloadLink(anchor)) return
+            const taskUrl = String(anchor.getAttribute('href') || '').trim()
+            anchor.dataset.missav115TransferBound = '1'
+            const button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'missav-magnet-action missav-native-115-transfer'
+            button.textContent = '转存115'
+            button.title = '将此磁力链接提交到当前浏览器登录的 115 离线下载'
+            button.style.cssText = 'margin-left:7px;cursor:pointer;'
+            button.addEventListener('click', () => submitTo115(taskUrl, button))
+            anchor.insertAdjacentElement('afterend', button)
+        })
+    }
+
+    function installNativeMissav115TransferObserver() {
+        if (!document.body || !location.hostname.toLowerCase().includes('missav')) return
+        attachNativeMissav115TransferButtons(document)
+        if (document.body.dataset.missav115TransferObserver === '1') return
+        document.body.dataset.missav115TransferObserver = '1'
+        const observer = new MutationObserver(records => {
+            records.forEach(record => record.addedNodes.forEach(node => {
+                if (node.nodeType === Node.ELEMENT_NODE) attachNativeMissav115TransferButtons(node)
+            }))
+        })
+        observer.observe(document.body, { childList: true, subtree: true })
+    }
+
     function handle115OfflineHandoff() {
         if (!/115\.com$/i.test(location.hostname)) return
         const currentUrl = new URL(location.href)
@@ -2322,9 +2366,9 @@
             restore()
             if (canHandoff) setTimeout(() => open115OfflineHandoff(taskUrl), 250)
         }
-        if (!/^magnet:/i.test(String(taskUrl || '').trim())) {
+        if (!is115TransferableUrl(taskUrl)) {
             restore()
-            show115Notice('未检测到可用磁力链接，未提交到 115。\n请使用磁力结果卡片中的“转存115”按钮。', 'warning', 8000)
+            show115Notice('没有检测到磁力链接，未提交到 115。HTTP/HTTPS 下载链接不会转存。', 'warning', 8000)
             return
         }
         if (typeof GM_xmlhttpRequest !== 'function') {
@@ -8399,6 +8443,7 @@
         // 115页面由“本地同步”侧边栏接管，不再显示视频控制/字幕搜索侧边栏。
         if (is115UserPageForVideoAssistant()) return;
 
+        installNativeMissav115TransferObserver();
         createPanel();
         initVideoSelection();
         initListPageDiscovery();
