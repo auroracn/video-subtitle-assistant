@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.16
+// @version      2026.11.23.17
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.16'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.17'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -2278,22 +2278,50 @@
         return /^magnet:\?/i.test(String(value || '').trim())
     }
 
+    function extractNativeMagnetLink(element) {
+        if (!element || !element.attributes) return ''
+        const values = Array.from(element.attributes).map(attribute => attribute.value)
+        values.push(element.innerHTML || '')
+        const pattern = /magnet:\?[^\s"'<>\\]+/i
+        for (const rawValue of values) {
+            let value = String(rawValue || '').replace(/&amp;/gi, '&').replace(/\\u0026/gi, '&').replace(/\\\//g, '/')
+            try { value = decodeURIComponent(value) } catch (_) {}
+            const match = value.match(pattern)
+            if (match && is115TransferableUrl(match[0])) return match[0]
+        }
+        return ''
+    }
+
     function isNativeMissavDownloadLink(anchor) {
-        if (!anchor || anchor.dataset.missav115TransferBound === '1') return false
-        const rawHref = String(anchor.getAttribute('href') || '').trim()
-        return is115TransferableUrl(rawHref)
+        if (!anchor || anchor.dataset.missav115TransferBound === '1') return ''
+        const ownMagnet = extractNativeMagnetLink(anchor)
+        if (ownMagnet) return ownMagnet
+        const row = anchor.closest('tr,li,[class*=download],[class*=torrent],[class*=magnet]')
+        const rowMagnet = row ? extractNativeMagnetLink(row) : ''
+        if (rowMagnet) return rowMagnet
+        let parent = anchor.parentElement
+        for (let depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
+            const magnet = extractNativeMagnetLink(parent)
+            if (!magnet) continue
+            const text = String(parent.textContent || '')
+            if (/\.(?:mp4|mkv|avi|wmv|mov|ts|torrent)\b/i.test(text) ||
+                /\d+(?:[.,]\d+)?\s*(?:TB|TIB|GB|GIB|MB|MIB)\b/i.test(text)) return magnet
+        }
+        return ''
     }
 
     function attachNativeMissav115TransferButtons(root) {
         if (!document.body || !location.hostname.toLowerCase().includes('missav')) return
         const scope = root && root.querySelectorAll ? root : document
-        const anchors = []
-        if (scope.matches && scope.matches('a[href]')) anchors.push(scope)
-        anchors.push(...scope.querySelectorAll('a[href]'))
-        anchors.forEach(anchor => {
-            if (!isNativeMissavDownloadLink(anchor)) return
-            const taskUrl = String(anchor.getAttribute('href') || '').trim()
-            anchor.dataset.missav115TransferBound = '1'
+        const candidates = []
+        if (scope.matches && scope.matches('a[href],[data-magnet],[data-url],[data-href],[onclick]')) candidates.push(scope)
+        candidates.push(...scope.querySelectorAll('a[href],[data-magnet],[data-url],[data-href],[onclick]'))
+        candidates.forEach(candidate => {
+            const taskUrl = isNativeMissavDownloadLink(candidate)
+            if (!taskUrl) return
+            const item = candidate.closest('tr,li,[class*=download],[class*=torrent],[class*=magnet]') || candidate
+            if (item.querySelector('[data-missav115-transfer-bound="1"]')) return
+            item.dataset.missav115TransferBound = '1'
             const button = document.createElement('button')
             button.type = 'button'
             button.className = 'missav-magnet-action missav-native-115-transfer'
@@ -2301,7 +2329,7 @@
             button.title = '将此磁力链接提交到当前浏览器登录的 115 离线下载'
             button.style.cssText = 'margin-left:7px;cursor:pointer;'
             button.addEventListener('click', () => submitTo115(taskUrl, button))
-            anchor.insertAdjacentElement('afterend', button)
+            candidate.insertAdjacentElement('afterend', button)
         })
     }
 
