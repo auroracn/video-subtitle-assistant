@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.12
+// @version      2026.11.23.14
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.12'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.14'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -181,29 +181,6 @@
     const VIDEO_PLAYLIST_REFRESH_INTERVAL = 8 * 60 * 1000
     const VIDEO_PLAYLIST_REFRESH_MIN_GAP = 8000
     const VIDEO_PLAYLIST_FORCE_MIN_GAP = 1200
-    const VIDEO_TRANSCODE_COMMAND = 'ffmpeg -i "输入.mp4" -map 0:v:0 -map 0:a? -sn -dn -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -profile:v high -level 4.1 -c:a aac -b:a 128k -ac 2 -movflags +faststart "输出_115.mp4"'
-    const VIDEO_TRANSCODE_BAT = [
-        '@echo off',
-        'setlocal',
-        'if "%~1"=="" (',
-        '  echo Usage: drag a video file onto this .bat',
-        '  echo Output: same folder, filename_115.mp4  [H.264 + AAC + faststart]',
-        '  pause',
-        '  exit /b 1',
-        ')',
-        'set "FFMPEG=C:\\Users\\Admin\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.exe"',
-        'if not exist "%FFMPEG%" set "FFMPEG=ffmpeg"',
-        'echo Transcoding: %~nx1',
-        '"%FFMPEG%" -hide_banner -y -i "%~1" -map 0:v:0 -map "0:a?" -sn -dn -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -profile:v high -level 4.1 -c:a aac -b:a 128k -ac 2 -movflags +faststart "%~dpn1_115.mp4"',
-        'if errorlevel 1 (',
-        '  echo Transcode failed. Check FFmpeg install and file lock.',
-        '  pause',
-        '  exit /b 1',
-        ')',
-        'echo Done: %~dpn1_115.mp4',
-        'pause',
-        ''
-    ].join('\r\n')
     const VIDEO_HISTORY_PAGE_SIZE = 3
     const activeVideoDownloads = new Map()
     const VIDEO_SYNC_CHANNEL = 'missav-video-download-sync-v1'
@@ -1439,25 +1416,13 @@
         }
     }
 
-    function download115TranscodeScript() {
-        const blob = new Blob([VIDEO_TRANSCODE_BAT], { type: 'application/octet-stream' })
-        const url = URL.createObjectURL(blob)
-        const link = document.createElement('a')
-        link.href = url
-        link.download = '115兼容转码.bat'
-        document.body.appendChild(link)
-        link.click()
-        link.remove()
-        setTimeout(() => URL.revokeObjectURL(url), 60000)
-    }
-
-    async function remuxFragmentedMp4ToProgressiveMp4(inputBlob, controls, runtime) {
+    async function convertMp4For115(inputBlob, controls, runtime, reencode) {
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
 
         if (inputBlob.size > FFMPEG_MAX_INPUT_BYTES) {
             const sizeMb = Math.round(inputBlob.size / 1024 / 1024)
-            console.warn('[MissAV 下载] 文件 ' + sizeMb + ' MB 超过浏览器整理上限，导出原始分片 MP4；需桌面 FFmpeg 二次整理')
-            controls.progress.textContent = '文件 ' + sizeMb + ' MB 超过浏览器整理上限，已导出原始 MP4（115 可能不识别）'
+            console.warn('[MissAV 下载] 文件 ' + sizeMb + ' MB 超过浏览器内存整理上限，导出原始 MP4')
+            controls.progress.textContent = '文件 ' + sizeMb + ' MB 超过浏览器内存整理上限，保留原始 MP4'
             return { blob: inputBlob, compatible: false, tooLarge: true }
         }
 
@@ -1466,8 +1431,8 @@
             Math.max(3 * 60 * 1000, 3 * 60 * 1000 + Math.ceil(inputBlob.size / (8 * 1024 * 1024)) * 1000)
         )
         return queueFfmpegTask(async () => {
-            const inputName = 'missav-fragmented-input.mp4'
-            const outputName = 'missav-progressive-output.mp4'
+            const inputName = 'missav-convert-input.mp4'
+            const outputName = 'missav-115-compatible-output.mp4'
             const active = { controls: controls, runtime: runtime, lastProgressAt: 0 }
             let ffmpeg = null
             let stageAbortHandler = null
@@ -1492,8 +1457,23 @@
                     if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
                     controls.progress.textContent = '正在整理为 115 兼容 MP4：写入输入数据'
                     await ffmpeg.writeFile(inputName, inputBytes)
-                    controls.progress.textContent = '正在整理为 115 兼容 MP4：开始无损整理'
-                    await ffmpeg.exec([
+                    const command = reencode ? [
+                        '-i', inputName,
+                        '-map', '0:v:0',
+                        '-map', '0:a?',
+                        '-sn', '-dn',
+                        '-c:v', 'libx264',
+                        '-preset', 'veryfast',
+                        '-crf', '22',
+                        '-pix_fmt', 'yuv420p',
+                        '-profile:v', 'high',
+                        '-level', '4.1',
+                        '-c:a', 'aac',
+                        '-b:a', '128k',
+                        '-ac', '2',
+                        '-movflags', '+faststart',
+                        outputName
+                    ] : [
                         '-i', inputName,
                         '-map', '0:v:0',
                         '-map', '0:a?',
@@ -1501,7 +1481,12 @@
                         '-avoid_negative_ts', 'make_zero',
                         '-movflags', '+faststart',
                         outputName
-                    ], -1, { signal: stageRuntime.controller.signal })
+                    ]
+                    controls.progress.textContent = reencode
+                        ? '正在自动转换为 115 兼容格式（H.264/AAC）'
+                        : '正在无损整理为普通 MP4'
+                    const exitCode = await ffmpeg.exec(command, -1, { signal: stageRuntime.controller.signal })
+                    if (exitCode !== 0) throw new Error('FFmpeg 退出码 ' + exitCode)
                     if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
                     controls.progress.textContent = '正在整理为 115 兼容 MP4：读取输出文件'
                     const outputBytes = await ffmpeg.readFile(outputName)
@@ -1509,11 +1494,11 @@
                     const view = outputBytes instanceof Uint8Array
                         ? outputBytes
                         : new Uint8Array(outputBytes)
-                    return { blob: new Blob([view], { type: 'video/mp4' }), compatible: true, tooLarge: false }
+                    return { blob: new Blob([view], { type: 'video/mp4' }), compatible: true, tooLarge: false, reencoded: reencode }
                 }, {
                     runtime: runtime,
                     controls: controls,
-                    label: 'MP4 整理',
+                    label: reencode ? '115 兼容转码' : 'MP4 无损整理',
                     timeoutMs: timeoutMs,
                     heartbeat: heartbeat => {
                         const state = ffmpegState.active
@@ -1609,44 +1594,53 @@
         blobs.length = 0
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
         const fragmented = await isFragmentedMp4(assembledBlob)
-        let remuxResult
+        let conversionResult = { blob: assembledBlob, compatible: !fragmented, tooLarge: false, reencoded: false }
         let warning = ''
         if (fragmented) {
             try {
-                remuxResult = await remuxFragmentedMp4ToProgressiveMp4(assembledBlob, controls, runtime)
+                conversionResult = await convertMp4For115(assembledBlob, controls, runtime, false)
             } catch (error) {
                 if (isVideoRuntimeCancelled(runtime)) throw error
-                // 整理属于「锦上添花」，失败不能让已下载好的分片变成一次失败任务。
                 console.error('[MissAV 下载] MP4 整理失败，降级导出原始文件：', error)
-                warning = 'MP4 整理失败（' + (error.message || error) + '）；已导出原始 MP4，115 网盘可能不识别，点击“重新导出”可重试'
-                remuxResult = { blob: assembledBlob, compatible: false, tooLarge: false }
+                warning = 'MP4 无损整理失败（' + (error.message || error) + '）；已保留原始 MP4'
+                conversionResult = { blob: assembledBlob, compatible: false, tooLarge: false, reencoded: false }
             }
-        } else {
-            remuxResult = { blob: assembledBlob, compatible: true, tooLarge: false }
-        }
-        const outputBlob = remuxResult.blob
-        const ready = await is115ReadyMp4(outputBlob)
-        if (fragmented && remuxResult.compatible && !ready) {
-            warning = '整理结果仍不是 115 兼容 MP4（缺少前置 moov 或仍为分片结构）；已导出原始文件，点击“重新导出”可重试'
-            console.warn('[MissAV 下载] ' + warning)
         }
         let codecInfo = { friendly: null, label: '编码未识别', issues: [] }
         controls.progress.title = ''
         try {
-            codecInfo = await inspectMp4Codecs(outputBlob)
+            codecInfo = await inspectMp4Codecs(conversionResult.blob)
         } catch (error) {
             console.warn('[MissAV 下载] 编码检测失败：', error)
         }
-        if (codecInfo.friendly === false && controls.connectionDetails) {
-            const detail = '\n[115 兼容诊断] ' + codecInfo.issues.join('；') +
-                '\n[转码命令] ' + VIDEO_TRANSCODE_COMMAND
-            controls.connectionDetails.textContent = (controls.connectionDetails.textContent || '') + detail
-            controls.connectionDetails.hidden = false
-            controls.progress.title = VIDEO_TRANSCODE_COMMAND
-            console.warn('[MissAV 下载] 导出文件编码不适合 115 在线预览：' + codecInfo.issues.join('；'))
+        let ready = await is115ReadyMp4(conversionResult.blob)
+        if ((codecInfo.friendly !== true || !ready) && !conversionResult.tooLarge) {
+            try {
+                const transcoded = await convertMp4For115(conversionResult.blob, controls, runtime, true)
+                if (transcoded.tooLarge) {
+                    conversionResult.tooLarge = true
+                    warning = '文件超过浏览器内自动转码上限，已保留整理后的原文件'
+                } else {
+                    conversionResult = transcoded
+                    codecInfo = await inspectMp4Codecs(conversionResult.blob)
+                    ready = await is115ReadyMp4(conversionResult.blob)
+                    fileInfo.codecInfo = codecInfo
+                    if (codecInfo.friendly !== true || !ready) {
+                        warning = '自动转码已完成，但编码检查仍未确认 115 兼容性'
+                    } else {
+                        warning = ''
+                    }
+                }
+            } catch (error) {
+                if (isVideoRuntimeCancelled(runtime)) throw error
+                warning = '自动转换为 H.264/AAC 失败（' + (error.message || error) + '）；已保留原始文件'
+                console.error('[MissAV 下载] 自动 H.264/AAC 转码失败：', error)
+            }
         }
-        const codecHint = ' · ' + codecInfo.label +
-            (codecInfo.friendly === false ? '；点「下载转码脚本」' : '')
+        const outputBlob = conversionResult.blob
+        ready = await is115ReadyMp4(outputBlob)
+        if (!ready && !warning) warning = '导出文件未通过普通 MP4 结构检查，115 可能无法播放'
+        const codecHint = ' · ' + codecInfo.label + (conversionResult.reencoded ? ' · 已自动转为 H.264/AAC' : '')
         const blobUrl = URL.createObjectURL(outputBlob)
         const link = document.createElement('a')
         link.href = blobUrl
@@ -1659,8 +1653,8 @@
         updateVideoControls(controls, '重新导出', 'lightgreen', false)
         if (warning) {
             controls.progress.textContent = warning + codecHint + '；缓存仍保留'
-        } else if (remuxResult.tooLarge) {
-            controls.progress.textContent = '已完成（原始分片 MP4）；文件过大，浏览器内无法整理，115 网盘可能不识别。桌面整理：ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4；缓存仍保留' + codecHint
+        } else if (conversionResult.tooLarge) {
+            controls.progress.textContent = '已完成；文件过大，浏览器内无法自动整理，保留原文件；115 可能无法播放' + codecHint + '；缓存仍保留'
         } else if (ready) {
             controls.progress.textContent = '已完成（115 兼容 MP4，moov 前置）' + codecHint + '；缓存仍保留；不需要时点击“清除缓存”'
         } else {
@@ -2118,13 +2112,6 @@
         to115Button.textContent = '转存 115'
         actions.appendChild(to115Button)
 
-        const transcodeButton = document.createElement('button')
-        transcodeButton.className = 'missav-video-download-action missav-video-download-cache'
-        transcodeButton.type = 'button'
-        transcodeButton.textContent = '下载转码脚本'
-        transcodeButton.title = '生成 .bat：把视频拖到脚本上，用本机 FFmpeg 转成 H.264/AAC 的 115 兼容 MP4'
-        transcodeButton.addEventListener('click', download115TranscodeScript)
-        actions.appendChild(transcodeButton)
         card.appendChild(actions)
 
         const historySection = document.createElement('div')
