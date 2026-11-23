@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.9
+// @version      2026.11.23.10
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.9'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.10'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -177,7 +177,7 @@
     const VIDEO_AUTH_STATUSES = [410]
     const VIDEO_AUTH_RETRY_MAX_ATTEMPTS = 8
     const VIDEO_AUTH_COOLDOWN_MS = 2500
-    const VIDEO_TRANSPORTS = ['gm', 'gm-plain', 'fetch']
+    const VIDEO_TRANSPORTS = ['fetch', 'gm', 'gm-plain']
     const VIDEO_PLAYLIST_REFRESH_INTERVAL = 8 * 60 * 1000
     const VIDEO_PLAYLIST_REFRESH_MIN_GAP = 8000
     const VIDEO_PLAYLIST_FORCE_MIN_GAP = 1200
@@ -677,6 +677,23 @@
                     return result
                 } catch (error) {
                     if (runtime.clearing || runtime.controller.signal.aborted) throw error
+                    if (error && error.status === 403 && transportIndex < VIDEO_TRANSPORTS.length - 1) {
+                        transportIndex++
+                        const nextTransport = VIDEO_TRANSPORTS[transportIndex]
+                        if (monitor) {
+                            const connection = monitor.active.get(connectionId)
+                            if (connection) {
+                                connection.state = '切换请求通道'
+                                connection.transport = nextTransport
+                            }
+                            monitor.lastError = '当前请求通道返回 HTTP 403，切换到 ' + nextTransport + ' 重试'
+                            updateVideoConnectionMonitor(controls, runtime)
+                        }
+                        controls.progress.textContent = '分片 ' + ((segment.index || 0) + 1) +
+                            ' 的当前请求通道返回 HTTP 403，正在切换到 ' + nextTransport + ' 重试'
+                        await waitVideoRetry(500, runtime.controller.signal)
+                        continue
+                    }
                     if (isVideoAccessDenied(error) || isVideoVariantUnavailable(error)) throw error
                     attempt++
                     const authFailure = Boolean(error && error.authFailure)
