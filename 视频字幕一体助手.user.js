@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.5
+// @version      2026.11.23.6
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.5'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.6'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -167,9 +167,9 @@
     const VIDEO_AUTH_STATUSES = [401, 403, 410]
     const VIDEO_AUTH_RETRY_MAX_ATTEMPTS = 8
     const VIDEO_AUTH_COOLDOWN_MS = 2500
-    // 403 时的通道阶梯：页面 fetch → 油猴通道(带站内 Referer) → 油猴通道(不带 Referer)。
-    // 油猴通道不受页面 CORS 与 forbidden header 限制，可绕开防盗链/预检类 403。
-    const VIDEO_TRANSPORTS = ['fetch', 'gm', 'gm-plain']
+    // 分片从 surrit.com 跨域读取，优先用带目标站 Cookie 的油猴请求。
+    // 被拒绝时再尝试不带 Referer 的油猴请求，最后回退到页面 fetch。
+    const VIDEO_TRANSPORTS = ['gm', 'gm-plain', 'fetch']
     const VIDEO_PLAYLIST_REFRESH_INTERVAL = 8 * 60 * 1000
     const VIDEO_PLAYLIST_REFRESH_MIN_GAP = 8000
     const VIDEO_PLAYLIST_FORCE_MIN_GAP = 1200
