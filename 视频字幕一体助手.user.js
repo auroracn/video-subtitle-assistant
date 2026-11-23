@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.11
+// @version      2026.11.23.12
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.11'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.12'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -132,7 +132,7 @@
     }
 
     function isVideoAccessDenied(error) {
-        return [401, 429].includes(error && error.status) || Boolean(error && error.challenge) || Boolean(error && error.bucketPunished)
+        return [401, 429].includes(error && error.status) || Boolean(error && error.challenge)
     }
 
     function isVideoVariantUnavailable(error) {
@@ -585,6 +585,34 @@
         return fetchVideoSegmentFetch(segment, signal)
     }
 
+    async function fetchVideoSegmentFromAlternates(segment, runtime, controls, workerId) {
+        for (const url of segment.alternateUrls || []) {
+            const alternateSegment = Object.assign({}, segment, { url: url, alternateUrls: [] })
+            for (const transport of VIDEO_TRANSPORTS) {
+                if (runtime.controller.signal.aborted) throw new DOMException('下载已取消', 'AbortError')
+                if (runtime.connectionMonitor) {
+                    const connection = runtime.connectionMonitor.active.get(String(workerId || 1))
+                    if (connection) {
+                        connection.state = '尝试同片段其他尺寸'
+                        connection.transport = transport
+                        connection.host = getVideoConnectionHost(url)
+                    }
+                    runtime.connectionMonitor.lastError = '当前片段路径不可用，正在尝试同片段的其他尺寸'
+                    updateVideoConnectionMonitor(controls, runtime)
+                }
+                try {
+                    const blob = await fetchVideoSegment(alternateSegment, runtime.controller.signal, transport)
+                    console.info('[MissAV 下载] 分片 ' + (Number(segment.index) + 1) + ' 切换到匹配的其他尺寸成功')
+                    return blob
+                } catch (error) {
+                    if (runtime.controller.signal.aborted) throw error
+                    if (isVideoAccessDenied(error)) throw error
+                }
+            }
+        }
+        return null
+    }
+
     function waitVideoRetry(delay, signal) {
         return new Promise((resolve, reject) => {
             if (signal && signal.aborted) {
@@ -706,6 +734,17 @@
                             ' 的当前请求通道返回 HTTP 403，正在切换到 ' + nextTransport + ' 重试'
                         await waitVideoRetry(500, runtime.controller.signal)
                         continue
+                    }
+                    if (isVideoVariantUnavailable(error) && segment.alternateUrls && segment.alternateUrls.length) {
+                        const alternateBlob = await fetchVideoSegmentFromAlternates(segment, runtime, controls, workerId)
+                        if (alternateBlob) {
+                            if (monitor) {
+                                monitor.completed += 1
+                                const connection = monitor.active.get(connectionId)
+                                if (connection) connection.state = '已完成（替代尺寸）'
+                            }
+                            return alternateBlob
+                        }
                     }
                     if (isVideoAccessDenied(error) || isVideoVariantUnavailable(error)) throw error
                     attempt++
@@ -1717,7 +1756,14 @@
                                 throw error
                             }
                             failedIndexes.add(i)
-                            if (isVideoVariantUnavailable(error)) runtime.variantUnavailableError = error
+                            if (isVideoVariantUnavailable(error)) {
+                                runtime.variantUnavailableError = error
+                                if (!segment.alternateUrls || !segment.alternateUrls.length) {
+                                    workerError = error
+                                    runtime.controller.abort()
+                                    throw error
+                                }
+                            }
                             if (runtime.connectionMonitor) {
                                 runtime.connectionMonitor.failures.push({
                                     index: i,
@@ -1824,6 +1870,11 @@
                         }
                     }
                     if (fallbackInfo) {
+                        fallbackInfo.probedVariantInfos = fileInfo.probedVariantInfos || []
+                        attachVideoSegmentAlternateSizes(
+                            fallbackInfo.segments,
+                            fallbackInfo.probedVariantInfos.filter(info => info.url !== fallbackInfo.url)
+                        )
                         fallbackInfo.variantFallbacks = fileInfo.variantFallbacks.slice(fallbackIndex + 1)
                         Object.assign(fileInfo, fallbackInfo)
                         controls.qualityBadge.textContent = fileInfo.display
@@ -2019,7 +2070,8 @@
         head.appendChild(quality)
         const hint = document.createElement('span')
         hint.className = 'missav-video-download-hint'
-        hint.textContent = fileInfo.segments.length + ' 个分片 · 支持刷新续传'
+        hint.textContent = fileInfo.segments.length + ' 个分片 · 已探测 ' +
+            (fileInfo.probedVariantCount || 1) + ' 档尺寸 · 支持刷新续传'
         head.appendChild(hint)
         card.appendChild(head)
 
@@ -5742,6 +5794,7 @@
     function parseM3u8Segments(text, baseUrl) {
         const segments = []
         let pendingByteRange = null
+        let pendingDuration = null
         let pendingDiscontinuity = false
         let lastMapKey = ''
         const lastRangeEndByUrl = new Map()
@@ -5773,6 +5826,11 @@
                 pendingByteRange = trimmed.substring('#EXT-X-BYTERANGE:'.length).trim()
                 return
             }
+            if (trimmed.startsWith('#EXTINF:')) {
+                const duration = Number(trimmed.substring('#EXTINF:'.length).split(',')[0])
+                pendingDuration = Number.isFinite(duration) ? duration : null
+                return
+            }
             if (trimmed.startsWith('#EXT-X-DISCONTINUITY')) {
                 pendingDiscontinuity = true
                 return
@@ -5788,13 +5846,47 @@
                 url: segmentUrl,
                 rangeStart: range ? range.start : undefined,
                 rangeEnd: range ? range.end : undefined,
+                duration: pendingDuration,
                 discontinuityBefore: pendingDiscontinuity
             })
             if (range) lastRangeEndByUrl.set(segmentUrl, range.end + 1)
             pendingByteRange = null
+            pendingDuration = null
             pendingDiscontinuity = false
         })
         return segments
+    }
+
+    function videoSegmentPathKey(segment) {
+        return [segmentBasename(segment.url), segment.rangeStart ?? '', segment.rangeEnd ?? ''].join('|')
+    }
+
+    function matchingVideoSegmentPath(left, right) {
+        if (!left || !right || videoSegmentPathKey(left) !== videoSegmentPathKey(right)) return false
+        const rangeMatches = (a, b) => (Number.isFinite(a) ? a : -1) === (Number.isFinite(b) ? b : -1)
+        if (!rangeMatches(left.rangeStart, right.rangeStart) || !rangeMatches(left.rangeEnd, right.rangeEnd)) return false
+        if (Number.isFinite(left.duration) && Number.isFinite(right.duration)) {
+            return Math.abs(left.duration - right.duration) <= 0.1
+        }
+        return !Number.isFinite(left.duration) && !Number.isFinite(right.duration)
+    }
+
+    function attachVideoSegmentAlternateSizes(primarySegments, alternateVariantInfos) {
+        const alternatesByKey = new Map()
+        for (const variantInfo of alternateVariantInfos) {
+            for (const segment of variantInfo.segments) {
+                const key = videoSegmentPathKey(segment)
+                if (!alternatesByKey.has(key)) alternatesByKey.set(key, [])
+                alternatesByKey.get(key).push(segment)
+            }
+        }
+        for (const segment of primarySegments) {
+            const key = videoSegmentPathKey(segment)
+            segment.alternateUrls = Array.from(new Set((alternatesByKey.get(key) || [])
+                .filter(candidate => matchingVideoSegmentPath(segment, candidate))
+                .map(candidate => candidate.url)))
+                .filter(url => url !== segment.url)
+        }
     }
 
     async function loadVideoVariantInfo(fileInfo, variant) {
@@ -5819,6 +5911,21 @@
         }
     }
 
+    async function probeVideoVariantPlaylists(fileInfo, variants) {
+        const probed = []
+        for (const variant of variants) {
+            try {
+                const info = await loadVideoVariantInfo(fileInfo, variant)
+                info.variant = variant
+                probed.push(info)
+            } catch (error) {
+                if (isVideoAccessDenied(error)) throw error
+                console.warn('[MissAV 下载] 清晰度 ' + variant.display + ' 分片路径探测失败：', error)
+            }
+        }
+        return probed
+    }
+
     async function loadBestVideoInfo(candidates, filename, stableKey) {
         const list = (Array.isArray(candidates) ? candidates : [candidates])
             .map(url => String(url || ''))
@@ -5831,25 +5938,41 @@
                 const masterText = await fetchVideoList(masterUrl)
                 const variants = parseM3u8Variants(masterText, masterUrl)
                 const orderedVariants = orderM3u8Variants(variants)
-                const best = orderedVariants[0] || null
-                const playlistUrl = best ? best.url : masterUrl
-                const playlistText = best ? await fetchVideoList(playlistUrl) : masterText
-                const segments = parseM3u8Segments(playlistText, playlistUrl)
+                const fileInfoBase = {
+                    filename: filename,
+                    masterUrl: masterUrl,
+                    stableKey: stableKey || masterUrl,
+                    playlistCandidates: list
+                }
+                const probedVariants = orderedVariants.length
+                    ? await probeVideoVariantPlaylists(fileInfoBase, orderedVariants)
+                    : []
+                if (orderedVariants.length && !probedVariants.length) {
+                    throw new Error('找到清晰度列表，但所有分片播放列表都无法读取')
+                }
+                const bestInfo = probedVariants[0] || null
+                const playlistUrl = bestInfo ? bestInfo.url : masterUrl
+                const playlistText = bestInfo ? null : masterText
+                const segments = bestInfo ? bestInfo.segments : parseM3u8Segments(playlistText, playlistUrl)
                 if (!segments.length) throw new Error('播放列表没有找到视频分片')
+                const alternateVariants = bestInfo ? probedVariants.slice(1) : []
+                if (bestInfo) attachVideoSegmentAlternateSizes(segments, alternateVariants)
                 const segmentSignature = videoSegmentSignature(segments)
                 console.log('[MissAV 下载] 使用播放列表：' + masterUrl +
                     '（候选 ' + (i + 1) + '/' + list.length + '）')
                 return {
                     filename: filename,
-                    display: best ? best.display : '最高分辨率',
-                    codecInfo: best && best.codecInfo ? best.codecInfo : classifyM3u8Codecs(''),
+                    display: bestInfo ? bestInfo.display : '最高分辨率',
+                    codecInfo: bestInfo ? bestInfo.codecInfo : classifyM3u8Codecs(''),
                     url: playlistUrl,
                     masterUrl: masterUrl,
                     stableKey: stableKey || masterUrl,
                     playlistCandidates: list,
-                    variantFallbacks: orderedVariants.slice(1),
+                    probedVariantCount: probedVariants.length,
+                    probedVariantInfos: probedVariants,
+                    variantFallbacks: probedVariants.slice(1).map(item => item.variant),
                     segments: segments,
-                    container: /#EXT-X-MAP:/i.test(playlistText) ? 'mp4' : 'ts',
+                    container: bestInfo ? bestInfo.container : /#EXT-X-MAP:/i.test(playlistText) ? 'mp4' : 'ts',
                     segmentSignature: segmentSignature,
                     hasDiscontinuity: segments.some(segment => segment.discontinuityBefore),
                     // 缓存键用不随 CDN 域名漂移的 stableKey，避免换域名后旧分片失联。
