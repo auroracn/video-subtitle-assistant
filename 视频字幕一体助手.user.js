@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.6
+// @version      2026.11.23.8
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.6'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.8'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -107,8 +107,9 @@
                     timeout: 30000,
                     onload: res => {
                         const status = Number(res && res.status) || 0
-                        if (status < 200 || status >= 300) {
-                            finish(reject, new Error('获取播放列表失败：HTTP ' + status + '（油猴通道）'))
+                        const challenge = /^cf-mitigated:\s*challenge\s*$/im.test(res?.responseHeaders || '')
+                        if (status < 200 || status >= 300 || challenge) {
+                            finish(reject, makeVideoPlaylistError(status, challenge))
                         } else {
                             finish(resolve, String((res && res.responseText) || ''))
                         }
@@ -121,6 +122,21 @@
                 finish(reject, error)
             }
         })
+    }
+
+    function makeVideoPlaylistError(status, challenge) {
+        const error = new Error('获取播放列表失败：HTTP ' + status)
+        error.status = status
+        error.challenge = Boolean(challenge)
+        return error
+    }
+
+    function isVideoAccessDenied(error) {
+        return [401, 429].includes(error && error.status) || Boolean(error && error.challenge) || Boolean(error && error.bucketPunished)
+    }
+
+    function isVideoVariantUnavailable(error) {
+        return !isVideoAccessDenied(error) && [403, 404, 416].includes(error && error.status)
     }
 
     async function fetchVideoList(url, signal) {
@@ -141,14 +157,8 @@
             console.warn('[MissAV 下载] 播放列表 fetch 失败，切换油猴通道：', error)
             return fetchTextViaGM(url, signal)
         }
-        if (!response.ok) {
-            // 播放列表自身也会 403：页面 fetch 拿不到新签名时，改用油猴通道回源。
-            if (VIDEO_AUTH_STATUSES.includes(response.status)) {
-                console.warn('[MissAV 下载] 播放列表 HTTP ' + response.status + '，切换油猴通道')
-                return fetchTextViaGM(url, signal)
-            }
-            throw new Error('获取播放列表失败：HTTP ' + response.status)
-        }
+        const challenge = response.headers.get('cf-mitigated') === 'challenge'
+        if (!response.ok || challenge) throw makeVideoPlaylistError(response.status, challenge)
         const text = await response.text()
         return text
     }
@@ -163,12 +173,10 @@
     const VIDEO_RETRY_BASE_DELAY = 1500
     const VIDEO_RETRY_MAX_DELAY = 30000
     const VIDEO_NON_RETRYABLE_MAX_ATTEMPTS = 3
-    // 分片地址常带时效签名；长时间下载后旧签名会返回 401/403/410。
-    const VIDEO_AUTH_STATUSES = [401, 403, 410]
+    // 已过期的分片 URL 可以在原清晰度重新读取播放列表。
+    const VIDEO_AUTH_STATUSES = [410]
     const VIDEO_AUTH_RETRY_MAX_ATTEMPTS = 8
     const VIDEO_AUTH_COOLDOWN_MS = 2500
-    // 分片从 surrit.com 跨域读取，优先用带目标站 Cookie 的油猴请求。
-    // 被拒绝时再尝试不带 Referer 的油猴请求，最后回退到页面 fetch。
     const VIDEO_TRANSPORTS = ['gm', 'gm-plain', 'fetch']
     const VIDEO_PLAYLIST_REFRESH_INTERVAL = 8 * 60 * 1000
     const VIDEO_PLAYLIST_REFRESH_MIN_GAP = 8000
@@ -399,7 +407,8 @@
         if (current) return
         const jobs = await getAllVideoJobs().catch(() => [])
         const legacy = jobs.find(job => job && job.filename === fileInfo.filename &&
-            Number(job.total) === Number(fileInfo.segments.length))
+            Number(job.total) === Number(fileInfo.segments.length) &&
+            (job.segmentSignature || (job.segments?.length && videoSegmentSignature(job.segments))) === fileInfo.segmentSignature)
         if (!legacy) return
         fileInfo.jobId = legacy.id
         console.warn('[MissAV 下载] 源站地址变化，沿用已有缓存任务：' + legacy.id)
@@ -443,15 +452,16 @@
         }
     }
 
-    function makeVideoSegmentError(segment, status, detail) {
+    function makeVideoSegmentError(segment, status, detail, challenge) {
         const segmentNumber = (segment.index || 0) + 1
         const error = new Error('第 ' + segmentNumber + ' 个分片下载失败：HTTP ' + status +
             (detail ? '：' + detail : ''))
         error.status = status
+        error.challenge = challenge
         error.bucketPunished = /<Code>\s*BucketPunish\s*<\/Code>/i.test(detail || '')
         error.authFailure = VIDEO_AUTH_STATUSES.includes(status)
         error.retryable = !error.bucketPunished && [408, 425, 429, 500, 502, 503, 504].includes(status)
-        if (error.authFailure) {
+        if (error.authFailure || isVideoAccessDenied(error)) {
             // 便于事后确认是签名过期还是防盗链：只打印去掉查询参数的路径，不落敏感 token。
             console.warn('[MissAV 下载] 分片 ' + segmentNumber + ' HTTP ' + status +
                 ' · 路径 ' + stableVideoSegmentUrl(segment.url) + ' · 响应 ' + detail)
@@ -482,13 +492,14 @@
         const options = { signal: signal }
         if (range) options.headers = { Range: range.header }
         const response = await fetch(segment.url, options)
-        if (!response.ok) {
+        const challenge = response.headers.get('cf-mitigated') === 'challenge'
+        if (!response.ok || challenge) {
             let detail = ''
             try {
                 const text = await response.text()
                 detail = String(text || '').replace(/\s+/g, ' ').slice(0, 160)
             } catch (_) {}
-            throw makeVideoSegmentError(segment, response.status, detail)
+            throw makeVideoSegmentError(segment, response.status, detail, challenge)
         }
         const blob = await response.blob()
         return normalizeVideoSegmentBlob(segment, blob, response.status, range)
@@ -531,13 +542,14 @@
                     timeout: 60000,
                     onload: res => {
                         const status = Number(res && res.status) || 0
-                        if (status < 200 || status >= 300) {
+                        const challenge = /^cf-mitigated:\s*challenge\s*$/im.test(res?.responseHeaders || '')
+                        if (status < 200 || status >= 300 || challenge) {
                             let detail = ''
                             try {
-                                detail = String((res && res.responseText) || '')
-                                    .replace(/\s+/g, ' ').slice(0, 160)
+                                const bytes = res?.response
+                                if (bytes) detail = new TextDecoder().decode(bytes.slice(0, 1024)).replace(/\s+/g, ' ').slice(0, 160)
                             } catch (_) {}
-                            finish(reject, makeVideoSegmentError(segment, status, detail))
+                            finish(reject, makeVideoSegmentError(segment, status, detail, challenge))
                             return
                         }
                         try {
@@ -668,34 +680,7 @@
                     return result
                 } catch (error) {
                     if (runtime.clearing || runtime.controller.signal.aborted) throw error
-                    if (error && error.bucketPunished) {
-                        if (transportIndex < VIDEO_TRANSPORTS.length - 1) {
-                            transportIndex++
-                            const nextTransport = VIDEO_TRANSPORTS[transportIndex]
-                            if (monitor) {
-                                const connection = monitor.active.get(connectionId)
-                                if (connection) {
-                                    connection.state = '切换请求通道'
-                                    connection.transport = nextTransport
-                                }
-                                monitor.lastError = '页面请求收到 BucketPunish，改用油猴通道重试'
-                                updateVideoConnectionMonitor(controls, runtime)
-                            }
-                            controls.progress.textContent = '页面请求收到 BucketPunish，正在切换到' + nextTransport + '通道重试'
-                            await waitVideoRetry(800, runtime.controller.signal)
-                            continue
-                        }
-                        runtime.bucketPunished = true
-                        if (monitor) {
-                            const connection = monitor.active.get(connectionId)
-                            if (connection) connection.state = '源站限制'
-                            monitor.phase = '源站限制'
-                            monitor.lastError = '源站返回 BucketPunish，已停止其他分片请求'
-                            updateVideoConnectionMonitor(controls, runtime)
-                        }
-                        runtime.controller.abort()
-                        throw error
-                    }
+                    if (isVideoAccessDenied(error) || isVideoVariantUnavailable(error)) throw error
                     attempt++
                     const authFailure = Boolean(error && error.authFailure)
                     const retryable = error.retryable !== false
@@ -1698,6 +1683,13 @@
                         } catch (error) {
                             // 单个分片失败不再中断整轮下载：记录后继续，结尾统一提示补下。
                             if (runtime.clearing || runtime.controller.signal.aborted || workerError) throw error
+                            if (isVideoAccessDenied(error) || isVideoVariantUnavailable(error)) {
+                                runtime.accessDeniedError = isVideoAccessDenied(error) ? error : null
+                                runtime.variantUnavailableError = isVideoVariantUnavailable(error) ? error : null
+                                workerError = error
+                                runtime.controller.abort()
+                                throw error
+                            }
                             failedIndexes.add(i)
                             if (runtime.connectionMonitor) {
                                 runtime.connectionMonitor.failures.push({
@@ -1752,6 +1744,41 @@
                     updateVideoConnectionMonitor(controls, runtime)
                 }
                 const job = await getVideoJob(jobId).catch(() => null)
+                if (runtime.variantUnavailableError && Array.isArray(fileInfo.variantFallbacks) && fileInfo.variantFallbacks.length) {
+                    if (job && job.status !== 'completed') {
+                        job.status = 'paused'
+                        job.updatedAt = Date.now()
+                        await saveVideoJob(job).catch(() => {})
+                    }
+                    let fallbackInfo = null
+                    let fallbackError = null
+                    let fallbackIndex = -1
+                    for (let i = 0; i < fileInfo.variantFallbacks.length; i++) {
+                        try {
+                            fallbackInfo = await loadVideoVariantInfo(fileInfo, fileInfo.variantFallbacks[i])
+                            fallbackIndex = i
+                            break
+                        } catch (loadError) {
+                            fallbackError = loadError
+                            if (isVideoAccessDenied(loadError)) break
+                        }
+                    }
+                    if (fallbackInfo) {
+                        fallbackInfo.variantFallbacks = fileInfo.variantFallbacks.slice(fallbackIndex + 1)
+                        Object.assign(fileInfo, fallbackInfo)
+                        controls.qualityBadge.textContent = fileInfo.display
+                        controls.qualityText.textContent = fileInfo.codecInfo && fileInfo.codecInfo.friendly !== null
+                            ? fileInfo.codecInfo.label
+                            : '自适应清晰度 · 编码待导出检测'
+                        controls.progress.textContent = '当前清晰度分片返回 HTTP ' + (runtime.variantUnavailableError.status || '') +
+                            '，改用 ' + fileInfo.display + ' 完整播放列表继续下载；原清晰度缓存保留'
+                        activeVideoDownloads.delete(jobId)
+                        notifyVideoCacheChanged('variant-fallback', jobId)
+                        await startOrResumeVideoDownload(fileInfo, controls, false)
+                        return
+                    }
+                    if (fallbackError) error = fallbackError
+                }
                 if (runtime.manualPause) {
                     if (job && job.status !== 'completed') {
                         job.status = 'paused'
@@ -1760,7 +1787,7 @@
                     }
                     updateVideoControls(controls, '继续下载', 'lightyellow', false)
                     controls.progress.textContent = '已手动暂停，缓存已保留；点击“继续下载”恢复'
-                } else if (runtime.bucketPunished) {
+                } else if (runtime.accessDeniedError && runtime.accessDeniedError.bucketPunished) {
                     if (job && job.status !== 'completed') {
                         job.status = 'paused'
                         job.updatedAt = Date.now()
@@ -1768,6 +1795,16 @@
                     }
                     updateVideoControls(controls, job && job.status === 'completed' ? '重新导出' : '继续下载', 'lightyellow', false)
                     controls.progress.textContent = '视频源返回 BucketPunish（服务端限制），已停止其他分片请求；已下载缓存保留。请稍后再继续下载'
+                } else if (runtime.accessDeniedError) {
+                    if (job && job.status !== 'completed') {
+                        job.status = 'paused'
+                        job.updatedAt = Date.now()
+                        await saveVideoJob(job).catch(() => {})
+                    }
+                    updateVideoControls(controls, '继续下载', 'lightyellow', false)
+                    controls.progress.textContent = runtime.accessDeniedError.challenge
+                        ? '视频源返回 Cloudflare 验证页，已暂停并保留缓存；请先在视频源完成验证后再继续'
+                        : '视频源拒绝了分片请求（HTTP ' + (runtime.accessDeniedError.status || '未知') + '），已暂停并保留缓存'
                 } else if (job && job.status !== 'completed') {
                     job.status = 'paused'
                     job.updatedAt = Date.now()
@@ -2031,6 +2068,8 @@
         card.appendChild(historySection)
 
         const controls = {
+            qualityBadge: qualityBadge,
+            qualityText: qualityText,
             downloadButton: downloadButton,
             clearButton: clearButton,
             cacheButton: cacheButton,
@@ -5630,17 +5669,19 @@
             .filter(Boolean)
     }
 
-    function selectBestM3u8Variant(variants) {
+    function orderM3u8Variants(variants) {
         // 存在明确的 H.264+AAC 变体时优先选它：115 在线预览不必等云端转码。
         const compatible = VIDEO_PREFER_115_COMPATIBLE_CODEC
             ? variants.filter(item => item.codecInfo && item.codecInfo.friendly === true)
             : []
-        const candidates = compatible.length ? compatible : variants
-        return candidates.slice().sort((a, b) => {
+        const compare = (a, b) => {
             return (b.height - a.height) ||
                 (b.width - a.width) ||
                 (b.bandwidth - a.bandwidth)
-        })[0]
+        }
+        const preferred = compatible.slice().sort(compare)
+        const rest = variants.filter(item => !preferred.includes(item)).sort(compare)
+        return preferred.concat(rest)
     }
 
     function parseM3u8Segments(text, baseUrl) {
@@ -5701,6 +5742,28 @@
         return segments
     }
 
+    async function loadVideoVariantInfo(fileInfo, variant) {
+        const playlistText = await fetchVideoList(variant.url)
+        const segments = parseM3u8Segments(playlistText, variant.url)
+        if (!segments.length) throw new Error(variant.display + ' 播放列表没有找到视频分片')
+        const segmentSignature = videoSegmentSignature(segments)
+        const stableKey = fileInfo.stableKey || fileInfo.masterUrl || fileInfo.url
+        return {
+            filename: fileInfo.filename,
+            display: variant.display,
+            codecInfo: variant.codecInfo || classifyM3u8Codecs(''),
+            url: variant.url,
+            masterUrl: fileInfo.masterUrl,
+            stableKey: stableKey,
+            playlistCandidates: fileInfo.playlistCandidates || [],
+            segments: segments,
+            container: /#EXT-X-MAP:/i.test(playlistText) ? 'mp4' : 'ts',
+            segmentSignature: segmentSignature,
+            hasDiscontinuity: segments.some(segment => segment.discontinuityBefore),
+            jobId: videoJobId(stableKey, fileInfo.filename, segmentSignature)
+        }
+    }
+
     async function loadBestVideoInfo(candidates, filename, stableKey) {
         const list = (Array.isArray(candidates) ? candidates : [candidates])
             .map(url => String(url || ''))
@@ -5712,7 +5775,8 @@
             try {
                 const masterText = await fetchVideoList(masterUrl)
                 const variants = parseM3u8Variants(masterText, masterUrl)
-                const best = selectBestM3u8Variant(variants)
+                const orderedVariants = orderM3u8Variants(variants)
+                const best = orderedVariants[0] || null
                 const playlistUrl = best ? best.url : masterUrl
                 const playlistText = best ? await fetchVideoList(playlistUrl) : masterText
                 const segments = parseM3u8Segments(playlistText, playlistUrl)
@@ -5726,7 +5790,9 @@
                     codecInfo: best && best.codecInfo ? best.codecInfo : classifyM3u8Codecs(''),
                     url: playlistUrl,
                     masterUrl: masterUrl,
+                    stableKey: stableKey || masterUrl,
                     playlistCandidates: list,
+                    variantFallbacks: orderedVariants.slice(1),
                     segments: segments,
                     container: /#EXT-X-MAP:/i.test(playlistText) ? 'mp4' : 'ts',
                     segmentSignature: segmentSignature,
