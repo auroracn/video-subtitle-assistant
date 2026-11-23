@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.22.3
+    // @version      2026.11.22.4
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.22.3'
+    const VIDEO_SCRIPT_VERSION = '2026.11.22.4'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -676,6 +676,22 @@
                 } catch (error) {
                     if (runtime.clearing || runtime.controller.signal.aborted) throw error
                     if (error && error.bucketPunished) {
+                        if (transportIndex < VIDEO_TRANSPORTS.length - 1) {
+                            transportIndex++
+                            const nextTransport = VIDEO_TRANSPORTS[transportIndex]
+                            if (monitor) {
+                                const connection = monitor.active.get(connectionId)
+                                if (connection) {
+                                    connection.state = '切换请求通道'
+                                    connection.transport = nextTransport
+                                }
+                                monitor.lastError = '页面请求收到 BucketPunish，改用油猴通道重试'
+                                updateVideoConnectionMonitor(controls, runtime)
+                            }
+                            controls.progress.textContent = '页面请求收到 BucketPunish，正在切换到' + nextTransport + '通道重试'
+                            await waitVideoRetry(800, runtime.controller.signal)
+                            continue
+                        }
                         runtime.bucketPunished = true
                         if (monitor) {
                             const connection = monitor.active.get(connectionId)
