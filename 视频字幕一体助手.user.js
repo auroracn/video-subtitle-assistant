@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.10
+// @version      2026.11.23.11
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.10'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.11'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -500,6 +500,19 @@
         }
         const blob = await response.blob()
         return normalizeVideoSegmentBlob(segment, blob, response.status, range)
+    }
+
+    async function fetchVideoSegmentFromBrowserCache(segment, signal) {
+        const range = videoSegmentRange(segment, true)
+        const options = { signal: signal, cache: 'force-cache' }
+        if (range) options.headers = { Range: range.header }
+        const response = await fetch(segment.url, options)
+        if (!response.ok) {
+            let detail = ''
+            try { detail = String(await response.text()).replace(/\s+/g, ' ').slice(0, 160) } catch (_) {}
+            throw makeVideoSegmentError(segment, response.status, detail)
+        }
+        return normalizeVideoSegmentBlob(segment, await response.blob(), response.status, range)
     }
 
     function fetchVideoSegmentGM(segment, signal, withReferer) {
@@ -1697,14 +1710,14 @@
                         } catch (error) {
                             // 单个分片失败不再中断整轮下载：记录后继续，结尾统一提示补下。
                             if (runtime.clearing || runtime.controller.signal.aborted || workerError) throw error
-                            if (isVideoAccessDenied(error) || isVideoVariantUnavailable(error)) {
+                            if (isVideoAccessDenied(error)) {
                                 runtime.accessDeniedError = isVideoAccessDenied(error) ? error : null
-                                runtime.variantUnavailableError = isVideoVariantUnavailable(error) ? error : null
                                 workerError = error
                                 runtime.controller.abort()
                                 throw error
                             }
                             failedIndexes.add(i)
+                            if (isVideoVariantUnavailable(error)) runtime.variantUnavailableError = error
                             if (runtime.connectionMonitor) {
                                 runtime.connectionMonitor.failures.push({
                                     index: i,
@@ -1739,7 +1752,40 @@
                 throw workerError || error
             }
             if (failedIndexes.size) {
-                throw new Error(failedIndexes.size + ' 个分片暂未下载（多为地址失效），缓存已保留；点击“继续下载”只补这部分分片')
+                runtime.connectionMonitor.phase = '尝试读取浏览器缓存'
+                updateVideoConnectionMonitor(controls, runtime)
+                const pendingIndexes = Array.from(failedIndexes).sort((a, b) => a - b)
+                for (const index of pendingIndexes) {
+                    if (runtime.clearing || runtime.controller.signal.aborted) throw new Error('下载已取消')
+                    controls.progress.textContent = '尝试从浏览器缓存补取第 ' + (index + 1) + ' 个分片'
+                    try {
+                        const blob = await fetchVideoSegmentFromBrowserCache(job.segments[index], runtime.controller.signal)
+                        await saveVideoSegment(job, index, blob)
+                        cachedIndexes.add(index)
+                        failedIndexes.delete(index)
+                        job.completed = cachedIndexes.size
+                        job.updatedAt = Date.now()
+                        await saveVideoJob(job)
+                        runtime.connectionMonitor.failures = runtime.connectionMonitor.failures
+                            .filter(failure => failure.index !== index)
+                    } catch (cacheError) {
+                        if (isVideoAccessDenied(cacheError)) {
+                            runtime.accessDeniedError = cacheError
+                            runtime.controller.abort()
+                            throw cacheError
+                        }
+                    }
+                }
+            }
+            if (failedIndexes.size) {
+                const missing = Array.from(failedIndexes).sort((a, b) => a - b)
+                const shown = missing.slice(0, 24).map(index => index + 1).join(', ')
+                const summary = missing.length > 24 ? shown + ' …（共 ' + missing.length + ' 个）' : shown
+                runtime.connectionMonitor.phase = '仍有分片缺失'
+                runtime.connectionMonitor.lastError = '缺失分片：' + summary
+                updateVideoConnectionMonitor(controls, runtime)
+                if (runtime.variantUnavailableError) runtime.variantUnavailableError.missingIndexes = missing
+                throw new Error('仍有 ' + missing.length + ' 个分片无法取得；已尝试读取浏览器缓存。缺失分片：' + summary + '。缓存已保留，未合并不完整视频')
             }
 
             job.status = 'completed'
