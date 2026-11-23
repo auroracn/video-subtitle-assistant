@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-    // @version      2026.11.22.4
+    // @version      2026.11.23.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.22.4'
+    const VIDEO_SCRIPT_VERSION = '2026.11.23.1'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -159,7 +159,7 @@
     const VIDEO_SEGMENT_STORE = 'segments'
     const VIDEO_SETTINGS_STORE = 'settings'
     const VIDEO_CACHE_DIRECTORY_KEY = 'directory-handle'
-    const VIDEO_DOWNLOAD_CONCURRENCY = 4
+    const VIDEO_DOWNLOAD_CONCURRENCY = 1
     const VIDEO_RETRY_BASE_DELAY = 1500
     const VIDEO_RETRY_MAX_DELAY = 30000
     const VIDEO_NON_RETRYABLE_MAX_ATTEMPTS = 3
