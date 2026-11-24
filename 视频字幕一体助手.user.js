@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.23.20
+// @version      2026.11.24.1
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.23.20'
+    const VIDEO_SCRIPT_VERSION = '2026.11.24.1'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -1573,12 +1573,14 @@
         return new Blob(outputChunks, { type: 'video/mp4' })
     }
 
-    async function exportCachedVideo(job, controls, runtime) {
+    async function exportCachedVideo(job, controls, runtime, skippedIndexes) {
         updateVideoControls(controls, '正在合并...', 'lightyellow', true)
         controls.progress.textContent = '正在从缓存生成文件'
         const blobs = []
+        const skipped = skippedIndexes || new Set()
         for (let i = 0; i < job.segments.length; i++) {
             if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
+            if (skipped.has(i)) continue
             if (i === 0 || (i + 1) % 10 === 0 || i + 1 === job.segments.length) {
                 controls.progress.textContent = '正在读取缓存 ' + (i + 1) + '/' + job.segments.length + ' 个分片'
             }
@@ -1586,6 +1588,7 @@
             if (!blob) throw new Error('缓存中缺少第 ' + (i + 1) + ' 个分片')
             blobs.push(blob)
         }
+        if (!blobs.length) throw new Error('没有可拼合的已缓存分片')
         if (isVideoRuntimeCancelled(runtime)) throw new Error('下载已取消')
         controls.progress.textContent = '正在拼接 ' + blobs.length + ' 个分片'
         const assembledBlob = job.container === 'ts'
@@ -1651,7 +1654,14 @@
         link.remove()
         setTimeout(() => URL.revokeObjectURL(blobUrl), 60000)
         updateVideoControls(controls, '重新导出', 'lightgreen', false)
-        if (warning) {
+        if (skipped.size) {
+            const skippedLabels = Array.from(skipped)
+                .map(index => getVideoMediaSegmentNumber(job.segments, index))
+                .filter(Number.isFinite)
+                .sort((a, b) => a - b)
+            controls.progress.textContent = '已强行拼合，跳过媒体分片 ' + formatVideoNumberRanges(skippedLabels) +
+                '；播放会跳过对应片段' + (warning ? '；' + warning : '') + codecHint + '；缓存仍保留'
+        } else if (warning) {
             controls.progress.textContent = warning + codecHint + '；缓存仍保留'
         } else if (conversionResult.tooLarge) {
             controls.progress.textContent = '已完成；文件过大，浏览器内无法自动整理，保留原文件；115 可能无法播放' + codecHint + '；缓存仍保留'
@@ -1659,6 +1669,113 @@
             controls.progress.textContent = '已完成（115 兼容 MP4，moov 前置）' + codecHint + '；缓存仍保留；不需要时点击“清除缓存”'
         } else {
             controls.progress.textContent = '已完成（MP4，未确认 115 兼容性）' + codecHint + '；缓存仍保留；不需要时点击“清除缓存”'
+        }
+    }
+
+    function getVideoMediaSegmentNumber(segments, targetIndex) {
+        let mediaNumber = 0
+        for (let index = 0; index < segments.length; index++) {
+            if (segments[index].isInit) continue
+            mediaNumber += 1
+            if (index === targetIndex) return mediaNumber
+        }
+        return null
+    }
+
+    function formatVideoNumberRanges(numbers) {
+        const sorted = Array.from(new Set(numbers)).sort((a, b) => a - b)
+        const ranges = []
+        for (let index = 0; index < sorted.length; index++) {
+            const start = sorted[index]
+            let end = start
+            while (index + 1 < sorted.length && sorted[index + 1] === end + 1) {
+                end = sorted[++index]
+            }
+            ranges.push(start === end ? String(start) : start + '-' + end)
+        }
+        return ranges.join(', ')
+    }
+
+    function parseVideoSkipSelection(value, segments) {
+        const mediaIndexes = []
+        for (let index = 0; index < segments.length; index++) {
+            if (!segments[index].isInit) mediaIndexes.push(index)
+        }
+        const selected = new Set()
+        const parts = String(value || '').trim().split(/[，,、\s]+/).filter(Boolean)
+        if (!parts.length) throw new Error('请填写要跳过的媒体分片编号')
+        for (const part of parts) {
+            const match = part.match(/^(\d+)(?:-(\d+))?$/)
+            if (!match) throw new Error('分片编号格式无效，请使用单个编号或范围，例如 1055 或 1055-1057')
+            const start = Number(match[1])
+            const end = Number(match[2] || match[1])
+            if (start < 1 || end < start || end > mediaIndexes.length) {
+                throw new Error('分片编号需在 1 到 ' + mediaIndexes.length + ' 之间')
+            }
+            for (let number = start; number <= end; number++) selected.add(mediaIndexes[number - 1])
+        }
+        return selected
+    }
+
+    async function forceAssembleSelectedVideoSegments(fileInfo, controls) {
+        if (activeVideoDownloads.has(fileInfo.jobId)) {
+            controls.progress.textContent = '请先暂停当前下载，再执行强行拼合'
+            return
+        }
+        let job = await getVideoJob(fileInfo.jobId)
+        if (!job) {
+            controls.progress.textContent = '当前没有可用的下载缓存'
+            return
+        }
+        job = { ...job, segments: fileInfo.segments, total: fileInfo.segments.length }
+        const skippedIndexes = parseVideoSkipSelection(controls.skipSegmentsInput.value, job.segments)
+        const cachedIndexes = new Set(await getVideoSegmentIndexes(job.id))
+        const missing = job.segments
+            .map((segment, index) => index)
+            .filter(index => !skippedIndexes.has(index) && !cachedIndexes.has(index))
+        if (missing.length) {
+            const missingMediaNumbers = missing
+                .filter(index => !job.segments[index].isInit)
+                .map(index => getVideoMediaSegmentNumber(job.segments, index))
+                .filter(Number.isFinite)
+            const missingLabels = [
+                missing.some(index => job.segments[index].isInit) ? '初始化片段' : '',
+                missingMediaNumbers.length ? '媒体分片 ' + formatVideoNumberRanges(missingMediaNumbers) : ''
+            ].filter(Boolean).join('、')
+            controls.progress.textContent = '仍缺少未选择跳过的分片：' + missingLabels +
+                '。请继续下载，或把确认放弃的编号加入跳过列表'
+            return
+        }
+        const hasRemainingMedia = job.segments.some((segment, index) =>
+            !segment.isInit && !skippedIndexes.has(index) && cachedIndexes.has(index))
+        if (!hasRemainingMedia) {
+            controls.progress.textContent = '没有剩余的已缓存媒体片段可拼合'
+            return
+        }
+        const skippedNumbers = Array.from(skippedIndexes)
+            .map(index => getVideoMediaSegmentNumber(job.segments, index))
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b)
+        const confirmed = window.confirm(
+            '将跳过媒体分片 ' + formatVideoNumberRanges(skippedNumbers) + '，仅拼合其余已缓存片段。\n' +
+            '跳过部分的画面和声音会缺失，且本次操作不会重新请求分片。是否继续？'
+        )
+        if (!confirmed) return
+        const runtime = { controller: new AbortController(), clearing: false }
+        controls.skipSegmentsButton.disabled = true
+        controls.downloadButton.disabled = true
+        try {
+            await exportCachedVideo(job, controls, runtime, skippedIndexes)
+        } catch (error) {
+            controls.progress.textContent = '强行拼合失败：' + (error.message || error) + '；缓存仍保留'
+            updateVideoControls(controls, job.status === 'completed' ? '重新导出' : '继续下载', 'lightyellow', false)
+        } finally {
+            controls.skipSegmentsButton.disabled = false
+            if (job.status === 'completed') {
+                controls.downloadButton.disabled = false
+            } else {
+                updateVideoControls(controls, '继续下载', 'lightyellow', false)
+            }
         }
     }
 
@@ -2014,6 +2131,11 @@
             '.missav-video-connection-toggle{min-height:25px;padding:0 8px;border:0;border-radius:5px;background:#475569;color:#e2e8f0;font-size:11px;cursor:pointer;white-space:nowrap;}',
             '.missav-video-connection-details{margin:0 0 8px;padding:6px 8px;border:1px solid rgba(148,163,184,.22);border-radius:5px;background:rgba(15,23,42,.6);color:#a5f3fc;font:10px/1.45 Consolas,monospace;white-space:pre-wrap;word-break:break-word;}',
             '.missav-video-download-actions{display:flex;flex-wrap:wrap;gap:7px;}',
+            '.missav-video-skip-panel{margin:8px 0;padding:8px;border:1px solid #475569;border-radius:7px;color:#cbd5e1;font-size:11px;}',
+            '.missav-video-skip-panel summary{cursor:pointer;color:#fbbf24;font-weight:600;}',
+            '.missav-video-skip-row{display:flex;gap:6px;margin-top:8px;}',
+            '.missav-video-skip-input{min-width:0;flex:1;padding:6px 8px;border:1px solid #64748b;border-radius:5px;background:#0f172a;color:#e2e8f0;font-size:11px;}',
+            '.missav-video-skip-button{padding:6px 9px;border:0;border-radius:5px;background:#b45309;color:#fff;font-size:11px;cursor:pointer;}',
             '.missav-video-download-action{min-height:31px;padding:0 12px;border:0;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;transition:filter .15s,transform .15s;}',
             '.missav-video-download-action:hover{filter:brightness(1.08);transform:translateY(-1px);}',
             '.missav-video-download-primary{background:#38bdf8;color:#082f49;}',
@@ -2073,6 +2195,31 @@
         progress.className = 'missav-video-download-status'
         progress.textContent = '准备下载'
         card.appendChild(progress)
+
+        const skipPanel = document.createElement('details')
+        skipPanel.className = 'missav-video-skip-panel'
+        const skipSummary = document.createElement('summary')
+        skipSummary.textContent = '异常片段处理（手动）'
+        skipPanel.appendChild(skipSummary)
+        const skipHelp = document.createElement('div')
+        skipHelp.textContent = '填写确认要放弃的媒体分片顺序编号（从 1 开始），支持逗号或范围，例如 1055 或 1055-1057。此操作只拼合已缓存片段，不会重新请求。'
+        skipHelp.style.marginTop = '6px'
+        skipPanel.appendChild(skipHelp)
+        const skipRow = document.createElement('div')
+        skipRow.className = 'missav-video-skip-row'
+        const skipSegmentsInput = document.createElement('input')
+        skipSegmentsInput.className = 'missav-video-skip-input'
+        skipSegmentsInput.type = 'text'
+        skipSegmentsInput.inputMode = 'numeric'
+        skipSegmentsInput.placeholder = '媒体分片编号'
+        skipSegmentsInput.setAttribute('aria-label', '要跳过的媒体分片编号')
+        const skipSegmentsButton = document.createElement('button')
+        skipSegmentsButton.className = 'missav-video-skip-button'
+        skipSegmentsButton.type = 'button'
+        skipSegmentsButton.textContent = '强行拼合'
+        skipRow.append(skipSegmentsInput, skipSegmentsButton)
+        skipPanel.appendChild(skipRow)
+        card.appendChild(skipPanel)
 
         const connectionRow = document.createElement('div')
         connectionRow.className = 'missav-video-connection-row'
@@ -2170,6 +2317,8 @@
             qualityBadge: qualityBadge,
             qualityText: qualityText,
             downloadButton: downloadButton,
+            skipSegmentsInput: skipSegmentsInput,
+            skipSegmentsButton: skipSegmentsButton,
             clearButton: clearButton,
             cacheButton: cacheButton,
             cacheDirectoryButton: cacheDirectoryButton,
@@ -2191,6 +2340,17 @@
                 pauseVideoDownload(fileInfo)
             } else {
                 startOrResumeVideoDownload(fileInfo, controls)
+            }
+        })
+        skipSegmentsButton.addEventListener('click', async () => {
+            if (skipSegmentsButton.disabled) return
+            skipSegmentsButton.disabled = true
+            try {
+                await forceAssembleSelectedVideoSegments(fileInfo, controls)
+            } catch (error) {
+                controls.progress.textContent = '强行拼合失败：' + (error.message || error) + '；缓存仍保留'
+            } finally {
+                skipSegmentsButton.disabled = false
             }
         })
         clearButton.addEventListener('click', () => clearVideoDownload(fileInfo, controls))
@@ -5865,7 +6025,8 @@
                             index: segments.length,
                             url: initUrl,
                             rangeStart: range ? range.start : undefined,
-                            rangeEnd: range ? range.end : undefined
+                            rangeEnd: range ? range.end : undefined,
+                            isInit: true
                         })
                         lastMapKey = mapKey
                     }
