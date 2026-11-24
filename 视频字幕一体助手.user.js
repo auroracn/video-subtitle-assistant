@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.24.3
+// @version      2026.11.24.4
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.24.3'
+    const VIDEO_SCRIPT_VERSION = '2026.11.24.4'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -1325,6 +1325,73 @@
         return hasMp4Box(bytes, 'moov') && !hasMp4Box(bytes, 'mvex')
     }
 
+    async function updateMp4CreationTime(blob, time) {
+        const parts = []
+        let offset = 0
+        let updatedFields = 0
+        const mp4EpochOffset = 2082844800
+        const mp4Time = Math.floor(time.getTime() / 1000) + mp4EpochOffset
+
+        while (offset + 8 <= blob.size) {
+            const header = new Uint8Array(await blob.slice(offset, offset + 16).arrayBuffer())
+            if (header.byteLength < 8) break
+            const view = new DataView(header.buffer, header.byteOffset, header.byteLength)
+            let boxSize = view.getUint32(0)
+            let headerSize = 8
+            if (boxSize === 1) {
+                if (header.byteLength < 16) throw new Error('MP4 扩展 Box 头不完整')
+                const largeSize = view.getBigUint64(8)
+                if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('MP4 Box 超出浏览器可处理范围')
+                boxSize = Number(largeSize)
+                headerSize = 16
+            } else if (boxSize === 0) {
+                boxSize = blob.size - offset
+            }
+            if (boxSize < headerSize || offset + boxSize > blob.size) throw new Error('MP4 Box 长度无效')
+            const type = String.fromCharCode(header[4], header[5], header[6], header[7])
+            if (type === 'moov') {
+                const moovBytes = new Uint8Array(await blob.slice(offset, offset + boxSize).arrayBuffer())
+                const timestampBoxes = new Set(['mvhd', 'tkhd', 'mdhd'])
+                const containers = new Set(['moov', 'trak', 'mdia'])
+                const walk = (start, end, depth) => {
+                    if (depth > 8 || start >= end) return
+                    forEachMp4Box(moovBytes, start, end, (childType, contentStart, contentEnd) => {
+                        if (timestampBoxes.has(childType)) {
+                            if (contentStart + 4 > contentEnd) return
+                            const version = moovBytes[contentStart]
+                            const fieldOffset = contentStart + 4
+                            if (version === 1) {
+                                if (fieldOffset + 16 > contentEnd) return
+                                const timestamp = BigInt(mp4Time)
+                                const boxView = new DataView(moovBytes.buffer, moovBytes.byteOffset)
+                                boxView.setBigUint64(fieldOffset, timestamp)
+                                boxView.setBigUint64(fieldOffset + 8, timestamp)
+                                updatedFields += 2
+                            } else if (version === 0) {
+                                if (fieldOffset + 8 > contentEnd) return
+                                const boxView = new DataView(moovBytes.buffer, moovBytes.byteOffset)
+                                boxView.setUint32(fieldOffset, mp4Time)
+                                boxView.setUint32(fieldOffset + 4, mp4Time)
+                                updatedFields += 2
+                            }
+                        } else if (containers.has(childType)) {
+                            walk(contentStart, contentEnd, depth + 1)
+                        }
+                    })
+                }
+                walk(0, moovBytes.byteLength, 0)
+                parts.push(moovBytes)
+            } else {
+                parts.push(blob.slice(offset, offset + boxSize))
+            }
+            offset += boxSize
+        }
+        if (offset !== blob.size || updatedFields === 0) {
+            throw new Error(updatedFields === 0 ? 'MP4 中没有找到创建时间字段' : 'MP4 顶层 Box 不完整')
+        }
+        return { blob: new Blob(parts, { type: 'video/mp4' }), updatedFields: updatedFields }
+    }
+
     const VIDEO_CODEC_NAMES = {
         avc1: 'H.264', avc3: 'H.264',
         hvc1: 'H.265', hev1: 'H.265',
@@ -1640,10 +1707,18 @@
                 console.error('[MissAV 下载] 自动 H.264/AAC 转码失败：', error)
             }
         }
-        const outputBlob = conversionResult.blob
+        let outputBlob = conversionResult.blob
+        let creationTimeHint = ''
+        try {
+            const timestampResult = await updateMp4CreationTime(outputBlob, new Date())
+            outputBlob = timestampResult.blob
+        } catch (error) {
+            creationTimeHint = ' · MP4 内部时间写入失败'
+            console.warn('[MissAV 下载] 未能更新 MP4 创建时间：', error)
+        }
         ready = await is115ReadyMp4(outputBlob)
         if (!ready && !warning) warning = '导出文件未通过普通 MP4 结构检查，115 可能无法播放'
-        const codecHint = ' · ' + codecInfo.label + (conversionResult.reencoded ? ' · 已自动转为 H.264/AAC' : '')
+        const codecHint = ' · ' + codecInfo.label + (conversionResult.reencoded ? ' · 已自动转为 H.264/AAC' : '') + creationTimeHint
         const blobUrl = URL.createObjectURL(outputBlob)
         const link = document.createElement('a')
         link.href = blobUrl
