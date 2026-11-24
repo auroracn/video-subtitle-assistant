@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频字幕一体助手
 // @namespace    local.missav.video-subtitle-assistant
-// @version      2026.11.24.1
+// @version      2026.11.24.3
 // @description  MissAV 视频最高分辨率下载、断点续传、115网盘番号查找、本地媒体字幕同步、磁力搜索与字幕搜索、预览、加载、倍速助手
 // @author       local merge
 // @license      MIT
@@ -73,7 +73,7 @@
 
 // ===== 视频发现助手 =====
 (function () {
-    const VIDEO_SCRIPT_VERSION = '2026.11.24.1'
+    const VIDEO_SCRIPT_VERSION = '2026.11.24.3'
     console.log('[MissAV 下载] 脚本版本 ' + VIDEO_SCRIPT_VERSION + ' 已加载')
     function fetchTextViaGM(url, signal) {
         return new Promise((resolve, reject) => {
@@ -1696,25 +1696,23 @@
         return ranges.join(', ')
     }
 
-    function parseVideoSkipSelection(value, segments) {
-        const mediaIndexes = []
-        for (let index = 0; index < segments.length; index++) {
-            if (!segments[index].isInit) mediaIndexes.push(index)
+    function updateVideoSkipPanel(controls, segments, missingIndexes) {
+        const indexes = Array.isArray(missingIndexes) ? missingIndexes : []
+        const mediaNumbers = indexes
+            .filter(index => segments[index] && !segments[index].isInit)
+            .map(index => getVideoMediaSegmentNumber(segments, index))
+            .filter(Number.isFinite)
+            .sort((a, b) => a - b)
+        const hasInitMissing = indexes.some(index => segments[index] && segments[index].isInit)
+        if (!mediaNumbers.length && !hasInitMissing) {
+            controls.skipSegmentsStatus.textContent = '下载尚未检测到可跳过的缺失片段。'
+            controls.skipSegmentsButton.disabled = true
+            return
         }
-        const selected = new Set()
-        const parts = String(value || '').trim().split(/[，,、\s]+/).filter(Boolean)
-        if (!parts.length) throw new Error('请填写要跳过的媒体分片编号')
-        for (const part of parts) {
-            const match = part.match(/^(\d+)(?:-(\d+))?$/)
-            if (!match) throw new Error('分片编号格式无效，请使用单个编号或范围，例如 1055 或 1055-1057')
-            const start = Number(match[1])
-            const end = Number(match[2] || match[1])
-            if (start < 1 || end < start || end > mediaIndexes.length) {
-                throw new Error('分片编号需在 1 到 ' + mediaIndexes.length + ' 之间')
-            }
-            for (let number = start; number <= end; number++) selected.add(mediaIndexes[number - 1])
-        }
-        return selected
+        controls.skipSegmentsStatus.textContent = hasInitMissing
+            ? '检测到初始化片段缺失，无法通过跳过该片段拼合。'
+            : '已检测到缺失媒体分片 ' + formatVideoNumberRanges(mediaNumbers) + '。'
+        controls.skipSegmentsButton.disabled = hasInitMissing
     }
 
     async function forceAssembleSelectedVideoSegments(fileInfo, controls) {
@@ -1728,8 +1726,17 @@
             return
         }
         job = { ...job, segments: fileInfo.segments, total: fileInfo.segments.length }
-        const skippedIndexes = parseVideoSkipSelection(controls.skipSegmentsInput.value, job.segments)
         const cachedIndexes = new Set(await getVideoSegmentIndexes(job.id))
+        const skippedIndexes = new Set((Array.isArray(job.missingSegments) ? job.missingSegments : [])
+            .filter(index => !cachedIndexes.has(index)))
+        if (!skippedIndexes.size) {
+            controls.progress.textContent = '下载流程尚未检测到缺失分片，暂时不能强行拼合'
+            return
+        }
+        if (Array.from(skippedIndexes).some(index => !job.segments[index] || job.segments[index].isInit)) {
+            controls.progress.textContent = '缺少播放列表初始化片段，无法仅跳过该片段进行拼合'
+            return
+        }
         const missing = job.segments
             .map((segment, index) => index)
             .filter(index => !skippedIndexes.has(index) && !cachedIndexes.has(index))
@@ -1742,8 +1749,8 @@
                 missing.some(index => job.segments[index].isInit) ? '初始化片段' : '',
                 missingMediaNumbers.length ? '媒体分片 ' + formatVideoNumberRanges(missingMediaNumbers) : ''
             ].filter(Boolean).join('、')
-            controls.progress.textContent = '仍缺少未选择跳过的分片：' + missingLabels +
-                '。请继续下载，或把确认放弃的编号加入跳过列表'
+            controls.progress.textContent = '除已检测到的缺失分片外，还缺少 ' + missingLabels +
+                '。请继续下载后再强行拼合'
             return
         }
         const hasRemainingMedia = job.segments.some((segment, index) =>
@@ -1753,12 +1760,13 @@
             return
         }
         const skippedNumbers = Array.from(skippedIndexes)
+            .filter(index => !cachedIndexes.has(index))
             .map(index => getVideoMediaSegmentNumber(job.segments, index))
             .filter(Number.isFinite)
             .sort((a, b) => a - b)
         const confirmed = window.confirm(
-            '将跳过媒体分片 ' + formatVideoNumberRanges(skippedNumbers) + '，仅拼合其余已缓存片段。\n' +
-            '跳过部分的画面和声音会缺失，且本次操作不会重新请求分片。是否继续？'
+            '下载检测到媒体分片 ' + formatVideoNumberRanges(skippedNumbers) + ' 缺失。\n' +
+            '确认放弃这些分片并仅拼合其余已缓存片段吗？对应画面和声音会缺失，本次操作不会重新请求。'
         )
         if (!confirmed) return
         const runtime = { controller: new AbortController(), clearing: false }
@@ -1770,7 +1778,7 @@
             controls.progress.textContent = '强行拼合失败：' + (error.message || error) + '；缓存仍保留'
             updateVideoControls(controls, job.status === 'completed' ? '重新导出' : '继续下载', 'lightyellow', false)
         } finally {
-            controls.skipSegmentsButton.disabled = false
+            updateVideoSkipPanel(controls, job.segments, job.missingSegments)
             if (job.status === 'completed') {
                 controls.downloadButton.disabled = false
             } else {
@@ -1832,6 +1840,8 @@
             }
 
             runtime.connectionMonitor.phase = '下载中'
+            job.missingSegments = []
+            updateVideoSkipPanel(controls, job.segments, [])
             job.status = 'downloading'
             job.completed = cachedIndexes.size
             job.updatedAt = Date.now()
@@ -1936,6 +1946,11 @@
             }
             if (failedIndexes.size) {
                 const missing = Array.from(failedIndexes).sort((a, b) => a - b)
+                job.missingSegments = missing
+                job.status = 'paused'
+                job.updatedAt = Date.now()
+                await saveVideoJob(job)
+                updateVideoSkipPanel(controls, job.segments, missing)
                 const shown = missing.slice(0, 24).map(index => index + 1).join(', ')
                 const summary = missing.length > 24 ? shown + ' …（共 ' + missing.length + ' 个）' : shown
                 runtime.connectionMonitor.phase = '仍有分片缺失'
@@ -1946,6 +1961,7 @@
             }
 
             job.status = 'completed'
+            job.missingSegments = []
             job.completed = job.total
             job.updatedAt = Date.now()
             await saveVideoJob(job)
@@ -2064,6 +2080,7 @@
         try {
             const job = await getVideoJob(fileInfo.jobId)
             if (!job) return
+            updateVideoSkipPanel(controls, fileInfo.segments, job.missingSegments)
             const cachedCount = (await getVideoSegmentIndexes(fileInfo.jobId)).length
             if (job.status === 'completed' && cachedCount === fileInfo.segments.length) {
                 updateVideoControls(controls, '重新导出', 'lightgreen', false)
@@ -2201,23 +2218,18 @@
         const skipSummary = document.createElement('summary')
         skipSummary.textContent = '异常片段处理（手动）'
         skipPanel.appendChild(skipSummary)
-        const skipHelp = document.createElement('div')
-        skipHelp.textContent = '填写确认要放弃的媒体分片顺序编号（从 1 开始），支持逗号或范围，例如 1055 或 1055-1057。此操作只拼合已缓存片段，不会重新请求。'
-        skipHelp.style.marginTop = '6px'
-        skipPanel.appendChild(skipHelp)
+        const skipSegmentsStatus = document.createElement('div')
+        skipSegmentsStatus.textContent = '下载尚未检测到可跳过的缺失片段。'
+        skipSegmentsStatus.style.marginTop = '6px'
+        skipPanel.appendChild(skipSegmentsStatus)
         const skipRow = document.createElement('div')
         skipRow.className = 'missav-video-skip-row'
-        const skipSegmentsInput = document.createElement('input')
-        skipSegmentsInput.className = 'missav-video-skip-input'
-        skipSegmentsInput.type = 'text'
-        skipSegmentsInput.inputMode = 'numeric'
-        skipSegmentsInput.placeholder = '媒体分片编号'
-        skipSegmentsInput.setAttribute('aria-label', '要跳过的媒体分片编号')
         const skipSegmentsButton = document.createElement('button')
         skipSegmentsButton.className = 'missav-video-skip-button'
         skipSegmentsButton.type = 'button'
+        skipSegmentsButton.disabled = true
         skipSegmentsButton.textContent = '强行拼合'
-        skipRow.append(skipSegmentsInput, skipSegmentsButton)
+        skipRow.appendChild(skipSegmentsButton)
         skipPanel.appendChild(skipRow)
         card.appendChild(skipPanel)
 
@@ -2317,7 +2329,7 @@
             qualityBadge: qualityBadge,
             qualityText: qualityText,
             downloadButton: downloadButton,
-            skipSegmentsInput: skipSegmentsInput,
+            skipSegmentsStatus: skipSegmentsStatus,
             skipSegmentsButton: skipSegmentsButton,
             clearButton: clearButton,
             cacheButton: cacheButton,
@@ -2350,7 +2362,8 @@
             } catch (error) {
                 controls.progress.textContent = '强行拼合失败：' + (error.message || error) + '；缓存仍保留'
             } finally {
-                skipSegmentsButton.disabled = false
+                const job = await getVideoJob(fileInfo.jobId).catch(() => null)
+                updateVideoSkipPanel(controls, fileInfo.segments, job && job.missingSegments)
             }
         })
         clearButton.addEventListener('click', () => clearVideoDownload(fileInfo, controls))
